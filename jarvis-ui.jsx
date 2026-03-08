@@ -30,7 +30,9 @@
     const iconMap = { git: "\u2325", security: "\uD83D\uDEE1", health: "\u2695", activity: "\u23F1" };
     const sevColor = { error: "var(--red)", warning: "var(--amb)", info: "var(--txt3)" };
     const sevBg = { error: "var(--redBg)", warning: "var(--ambBg)", info: "var(--glass2)" };
-    const actionLabels = { commit: "Commit", push: "Push", branch: "Branch", install: "Install" };
+    const actionLabels = window._jarvisCapabilities?.actions
+      ? Object.fromEntries(Object.entries(window._jarvisCapabilities.actions).map(([k, v]) => [k, v.label]))
+      : { commit: "Commit", push: "Push", branch: "Branch", install: "Install" };
     const [actionResult, setActionResult] = useState(null);
     const [loading, setLoading] = useState(false);
     const [pendingConfirm, setPendingConfirm] = useState(null);
@@ -1188,7 +1190,9 @@
     const sevColor = { error: "var(--red)", warning: "var(--amb)", info: "var(--txt3)" };
     const sevBg = { error: "var(--redBg)", warning: "var(--ambBg)", info: "var(--glass2)" };
     const sevLabel = { error: "Critical", warning: "Warning", info: "Info" };
-    const actionLabels = { commit: "Commit Changes", push: "Push to Remote", branch: "Create Branch", install: "Install Dependencies" };
+    const actionLabels = window._jarvisCapabilities?.actions
+      ? Object.fromEntries(Object.entries(window._jarvisCapabilities.actions).map(([k, v]) => [k, v.description || v.label]))
+      : { commit: "Commit Changes", push: "Push to Remote", branch: "Create Branch", install: "Install Dependencies" };
     const [expanded, setExpanded] = useState(false);
     const [actionResult, setActionResult] = useState(null);
     const [loading, setLoading] = useState(false);

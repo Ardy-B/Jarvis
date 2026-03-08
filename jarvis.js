@@ -1958,6 +1958,24 @@ class Jarvis {
   invalidateCache() { this._cache.generatedAt = 0; this._cacheInvalidated = true; }
   getCachedBriefing() { return this._cache.briefing; }
 
+  getCapabilities() {
+    return {
+      version: 1,
+      actions: {
+        commit:  { label: "Commit",  icon: "checkmark", riskLevel: "medium", requiresConfirmation: true, requiresGit: true, description: "Stage and commit changes" },
+        push:    { label: "Push",    icon: "upload",    riskLevel: "medium", requiresConfirmation: true, requiresGit: true, description: "Push commits to remote" },
+        branch:  { label: "Branch",  icon: "fork",      riskLevel: "low",    requiresConfirmation: true, requiresGit: true, description: "Create a feature branch" },
+        install: { label: "Install", icon: "package",   riskLevel: "low",    requiresConfirmation: true, requiresGit: false, description: "Run npm install" },
+      },
+      features: { briefing: true, memory: true, selfImprovement: true, hooks: true, agents: true, workflows: true, trends: true }
+    };
+  }
+
+  registerActionExecutor(actionName, executorFn) {
+    this._actionExecutors = this._actionExecutors || {};
+    this._actionExecutors[actionName] = executorFn;
+  }
+
   async getBriefing(force = false) {
     if (!force && this._cache.briefing && (Date.now() - this._cache.generatedAt < this.cacheTTL)) {
       return this._cache.briefing;
@@ -2137,6 +2155,7 @@ class Jarvis {
         globalInsights: globalInsights.filter(i => !this._dismissed.has(i.id)),
         trends: [],
         learnings: [],
+        capabilities: this.getCapabilities(),
       };
 
       // Trend detection — compare against historical snapshots
@@ -2206,9 +2225,16 @@ class Jarvis {
       res.json({ ok: true });
     });
 
+    app.get(`${prefix}/capabilities`, ...middlewares, (req, res) => {
+      res.json(this.getCapabilities());
+    });
+
     app.post(`${prefix}/action`, ...middlewares, async (req, res) => {
-      const { sessionId, action } = req.body;
+      const { sessionId, action, confirmed } = req.body;
       if (!sessionId || !action) return res.status(400).json({ error: "sessionId and action required" });
+
+      const caps = this.getCapabilities();
+      if (!caps.actions[action]) return res.status(400).json({ error: `Unknown action: ${action}` });
 
       const project = this._projects.find(p => p.id === sessionId);
       if (!project || !project.folder) return res.status(404).json({ error: "Project not found" });
@@ -2222,11 +2248,22 @@ class Jarvis {
       try {
         // Risk assessment gate — block high-risk actions unless confirmed
         const risk = await assessActionRisk(project, action);
-        if (risk.level === "high" && !req.body.confirmed) {
+        if (risk.level === "high" && !confirmed) {
           return res.json({ ok: false, requiresConfirmation: true, riskLevel: risk.level, reason: risk.reason,
             warning: unreliableRule ? unreliableRule.reason : undefined });
         }
 
+        // Check for a registered executor (host project provides real implementations)
+        const executor = this._actionExecutors?.[action];
+        if (executor) {
+          const result = await executor({ sessionId, action, confirmed, cwd, session: project });
+          if (result.requiresConfirmation) return res.json(result);
+          memory.recordAction(sessionId, action, "success");
+          this.invalidateCache();
+          return res.json({ ok: true, ...result });
+        }
+
+        // Advisory fallback — JARVIS can only observe, not execute
         switch (action) {
           case "commit": {
             const status = await run("git", ["status", "--porcelain"], { cwd });
@@ -2236,7 +2273,7 @@ class Jarvis {
             break;
           }
           case "push": {
-            if (risk.level !== "low" && !req.body.confirmed) {
+            if (risk.level !== "low" && !confirmed) {
               return res.json({ ok: false, requiresConfirmation: true, riskLevel: risk.level, reason: risk.reason });
             }
             const unpushed = await run("git", ["log", "@{u}..HEAD", "--oneline"], { cwd });
@@ -2252,7 +2289,7 @@ class Jarvis {
             break;
           }
           case "install": {
-            if (risk.level !== "low" && !req.body.confirmed) {
+            if (risk.level !== "low" && !confirmed) {
               return res.json({ ok: false, requiresConfirmation: true, riskLevel: risk.level, reason: risk.reason });
             }
             await run("npm", ["install"], { cwd, timeout: 60000 });
