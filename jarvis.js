@@ -1,6 +1,7 @@
 /**
- * JARVIS — Proactive Project Assistant
- * Standalone module: content-aware briefings, git analysis, security scanning
+ * JARVIS — Autonomous Project Assistant
+ * Standalone module: content-aware briefings, git analysis, security scanning,
+ * persistent memory, trend detection, and self-reflection.
  * All shell operations are async (non-blocking) via child_process.execFile
  */
 
@@ -215,6 +216,41 @@ function analyzeProjectContext(project) {
     }
   } catch {}
 
+  // .claude/rules/ domain-specific rule files
+  try {
+    const rulesDir = path.join(cwd, ".claude", "rules");
+    if (fs.existsSync(rulesDir)) {
+      const ruleFiles = fs.readdirSync(rulesDir).filter(f => f.endsWith(".md"));
+      if (ruleFiles.length > 0) {
+        context.domainRules = ruleFiles.map(f => f.replace(/\.md$/, ""));
+        insights.push({
+          id: `claude-rules-${project.id}`, type: "health", severity: "info",
+          title: `${ruleFiles.length} domain rule${ruleFiles.length > 1 ? "s" : ""} active`,
+          detail: context.domainRules.join(", ").slice(0, 80),
+        });
+      }
+    }
+  } catch {}
+
+  // Plan.md — surface in-progress work for multi-session continuity
+  try {
+    const planMd = path.join(cwd, "Plan.md");
+    if (fs.existsSync(planMd)) {
+      const content = fs.readFileSync(planMd, "utf8").slice(0, 3000);
+      const match = content.match(/## In Progress\n([\s\S]*?)(?:\n##|$)/);
+      if (match) {
+        const tasks = match[1].split("\n").map(l => l.trim()).filter(l => l.startsWith("-") && !l.includes("None"));
+        if (tasks.length > 0) {
+          insights.push({
+            id: `plan-inprogress-${project.id}`, type: "activity", severity: "info",
+            title: `${tasks.length} task${tasks.length > 1 ? "s" : ""} in progress`,
+            detail: tasks[0].replace(/^-\s*/, "").slice(0, 80),
+          });
+        }
+      }
+    }
+  } catch {}
+
   // README.md fallback
   if (!context.description) {
     try {
@@ -274,6 +310,267 @@ function analyzeProjectContext(project) {
   return { context, insights };
 }
 
+// ── Safety Gates ─────────────────────────────────────────────────────────────
+
+async function assessActionRisk(project, action) {
+  const cwd = project.folder;
+  try {
+    switch (action) {
+      case "install": {
+        const hasModules = fs.existsSync(path.join(cwd, "node_modules"));
+        if (hasModules) {
+          return { level: "medium", reason: "node_modules already exists and will be reinstalled" };
+        }
+        return { level: "low", reason: "" };
+      }
+      case "push": {
+        const branch = await run("git", ["branch", "--show-current"], { cwd }).catch(() => "");
+        if (branch === "main" || branch === "master") {
+          return { level: "high", reason: `Pushing directly to ${branch} — consider a feature branch` };
+        }
+        return { level: "low", reason: "" };
+      }
+      default:
+        return { level: "low", reason: "" };
+    }
+  } catch {
+    return { level: "low", reason: "" };
+  }
+}
+
+// ── Memory Substrate ─────────────────────────────────────────────────────────
+// Persistent JSON-based memory — tracks insight history, dismissed patterns,
+// action outcomes, and learned rules. No external deps required.
+
+class JarvisMemory {
+  constructor(memoryPath) {
+    this._path = memoryPath;
+    this._data = { snapshots: [], dismissals: [], actions: [], rules: [], version: 1 };
+    this._maxSnapshots = 50;
+    this._maxDismissals = 200;
+    this._maxActions = 200;
+    this._load();
+  }
+
+  _load() {
+    try {
+      if (fs.existsSync(this._path)) {
+        const raw = fs.readFileSync(this._path, "utf8");
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.version) this._data = parsed;
+      }
+    } catch {}
+  }
+
+  _save() {
+    try {
+      const dir = path.dirname(this._path);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(this._path, JSON.stringify(this._data, null, 2));
+    } catch {}
+  }
+
+  // Record a briefing snapshot (compact form — just insight IDs, severities, counts)
+  recordSnapshot(briefing) {
+    if (!briefing || !briefing.sessions) return;
+    const snapshot = {
+      ts: Date.now(),
+      projectCount: briefing.sessions.length,
+      insights: [],
+      totalErrors: 0,
+      totalWarnings: 0,
+    };
+    for (const s of briefing.sessions) {
+      for (const i of (s.insights || [])) {
+        snapshot.insights.push({ id: i.id, type: i.type, severity: i.severity });
+        if (i.severity === "error") snapshot.totalErrors++;
+        if (i.severity === "warning") snapshot.totalWarnings++;
+      }
+    }
+    this._data.snapshots.push(snapshot);
+    if (this._data.snapshots.length > this._maxSnapshots) {
+      this._data.snapshots = this._data.snapshots.slice(-this._maxSnapshots);
+    }
+    this._save();
+  }
+
+  // Record a dismissal — used by reflection to detect false-positive patterns
+  recordDismissal(insightId) {
+    this._data.dismissals.push({ id: insightId, ts: Date.now() });
+    if (this._data.dismissals.length > this._maxDismissals) {
+      this._data.dismissals = this._data.dismissals.slice(-this._maxDismissals);
+    }
+    this._save();
+  }
+
+  // Record an action outcome — used to learn which actions succeed/fail
+  recordAction(projectId, action, outcome) {
+    this._data.actions.push({ projectId, action, outcome, ts: Date.now() });
+    if (this._data.actions.length > this._maxActions) {
+      this._data.actions = this._data.actions.slice(-this._maxActions);
+    }
+    this._save();
+  }
+
+  // Add or update a learned rule
+  addRule(rule) {
+    const existing = this._data.rules.findIndex(r => r.id === rule.id);
+    if (existing >= 0) {
+      this._data.rules[existing] = { ...this._data.rules[existing], ...rule, updatedAt: Date.now() };
+    } else {
+      this._data.rules.push({ ...rule, createdAt: Date.now() });
+    }
+    this._save();
+  }
+
+  removeRule(ruleId) {
+    this._data.rules = this._data.rules.filter(r => r.id !== ruleId);
+    this._save();
+  }
+
+  getRules() { return this._data.rules || []; }
+  getSnapshots() { return this._data.snapshots || []; }
+  getDismissals() { return this._data.dismissals || []; }
+  getActions() { return this._data.actions || []; }
+}
+
+// ── Trend Detection ──────────────────────────────────────────────────────────
+// Compares current briefing state against historical snapshots to surface
+// velocity and direction of project health.
+
+function detectTrends(currentBriefing, memory) {
+  const trends = [];
+  const snapshots = memory.getSnapshots();
+  if (snapshots.length < 2) return trends;
+
+  // Compare against the snapshot from ~24h ago (or the oldest available)
+  const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+  const baseline = snapshots.find(s => s.ts <= oneDayAgo) || snapshots[0];
+  const currentInsightIds = new Set();
+  let currentErrors = 0, currentWarnings = 0;
+
+  for (const s of (currentBriefing.sessions || [])) {
+    for (const i of (s.insights || [])) {
+      currentInsightIds.add(i.id);
+      if (i.severity === "error") currentErrors++;
+      if (i.severity === "warning") currentWarnings++;
+    }
+  }
+
+  // New issues since baseline
+  const baselineIds = new Set(baseline.insights.map(i => i.id));
+  const newIssues = [...currentInsightIds].filter(id => !baselineIds.has(id));
+  const resolvedIssues = [...baselineIds].filter(id => !currentInsightIds.has(id));
+
+  if (newIssues.length > 0) {
+    trends.push({
+      id: "trend-new-issues", type: "trend", severity: "info",
+      title: `${newIssues.length} new issue${newIssues.length > 1 ? "s" : ""} since last check`,
+      detail: newIssues.slice(0, 3).join(", "),
+    });
+  }
+
+  if (resolvedIssues.length > 0) {
+    trends.push({
+      id: "trend-resolved", type: "trend", severity: "info",
+      title: `${resolvedIssues.length} issue${resolvedIssues.length > 1 ? "s" : ""} resolved`,
+      detail: resolvedIssues.slice(0, 3).join(", "),
+    });
+  }
+
+  // Error trend direction
+  const errorDelta = currentErrors - baseline.totalErrors;
+  if (errorDelta > 0) {
+    trends.push({
+      id: "trend-errors-up", type: "trend", severity: "warning",
+      title: `Critical issues increased by ${errorDelta}`,
+      detail: `Was ${baseline.totalErrors}, now ${currentErrors}`,
+    });
+  } else if (errorDelta < 0) {
+    trends.push({
+      id: "trend-errors-down", type: "trend", severity: "info",
+      title: `Critical issues decreased by ${Math.abs(errorDelta)}`,
+      detail: `Was ${baseline.totalErrors}, now ${currentErrors}`,
+    });
+  }
+
+  return trends;
+}
+
+// ── Reflection Engine ────────────────────────────────────────────────────────
+// Analyzes memory to extract patterns and generate learned rules.
+// Runs after each briefing — lightweight, no external calls.
+
+function reflect(memory) {
+  const learnings = [];
+  const dismissals = memory.getDismissals();
+  const actions = memory.getActions();
+
+  // Pattern: repeatedly dismissed insights → likely false positive
+  if (dismissals.length >= 3) {
+    const counts = {};
+    for (const d of dismissals) {
+      // Normalize ID — strip project-specific suffix to find the pattern
+      const pattern = d.id.replace(/-[^-]+$/, "");
+      counts[pattern] = (counts[pattern] || 0) + 1;
+    }
+    for (const [pattern, count] of Object.entries(counts)) {
+      if (count >= 3) {
+        const ruleId = `auto-suppress-${pattern}`;
+        const existing = memory.getRules().find(r => r.id === ruleId);
+        if (!existing) {
+          learnings.push({
+            id: ruleId,
+            type: "auto-suppress",
+            pattern,
+            reason: `Dismissed ${count} times — likely a false positive or accepted risk`,
+            confidence: Math.min(count / 5, 1),
+          });
+        }
+      }
+    }
+  }
+
+  // Pattern: actions that consistently fail → surface a warning
+  if (actions.length >= 2) {
+    const failCounts = {};
+    const totalCounts = {};
+    for (const a of actions) {
+      const key = `${a.action}`;
+      totalCounts[key] = (totalCounts[key] || 0) + 1;
+      if (a.outcome === "error") failCounts[key] = (failCounts[key] || 0) + 1;
+    }
+    for (const [action, fails] of Object.entries(failCounts)) {
+      const total = totalCounts[action] || 0;
+      if (fails >= 2 && fails / total > 0.5) {
+        learnings.push({
+          id: `unreliable-action-${action}`,
+          type: "unreliable-action",
+          action,
+          reason: `Failed ${fails}/${total} times — may need manual intervention`,
+          confidence: fails / total,
+        });
+      }
+    }
+  }
+
+  // Persist high-confidence learnings as rules
+  for (const learning of learnings) {
+    if (learning.confidence >= 0.6) {
+      memory.addRule(learning);
+    }
+  }
+
+  return learnings;
+}
+
+// Check if an insight should be auto-suppressed based on learned rules
+function shouldSuppress(insightId, memory) {
+  const rules = memory.getRules().filter(r => r.type === "auto-suppress");
+  const pattern = insightId.replace(/-[^-]+$/, "");
+  return rules.some(r => r.pattern === pattern);
+}
+
 // ── Jarvis Class ─────────────────────────────────────────────────────────────
 
 class Jarvis {
@@ -284,6 +581,10 @@ class Jarvis {
     this._projects = [];
     this._cache = { briefing: null, generatedAt: 0, scanning: false };
     this._dismissed = new Set();
+
+    // Memory — stored alongside jarvis.js by default, or configurable
+    const memDir = opts.memoryPath || path.join(path.dirname(__filename), ".jarvis");
+    this._memory = new JarvisMemory(path.join(memDir, "memory.json"));
   }
 
   setProjects(projects) { this._projects = projects || []; }
@@ -320,7 +621,7 @@ class Jarvis {
           const allInsights = [
             ...gitInsights.filter(i => i.id),
             ...recap.insights, ...codeInsights, ...securityInsights, ...contextInsights,
-          ].filter(i => !this._dismissed.has(i.id));
+          ].filter(i => !this._dismissed.has(i.id) && !shouldSuppress(i.id, this._memory));
 
           const branch = gitInsights.branch || null;
           const uncommittedCount = gitInsights.filter(i => i.action === "commit").reduce((n, i) => {
@@ -369,7 +670,18 @@ class Jarvis {
         greeting: getGreeting(), headline, generatedAt: Date.now(),
         sessions: sessionResults,
         globalInsights: globalInsights.filter(i => !this._dismissed.has(i.id)),
+        trends: [],
+        learnings: [],
       };
+
+      // Trend detection — compare against historical snapshots
+      try { briefing.trends = detectTrends(briefing, this._memory); } catch {}
+
+      // Reflection — extract patterns from memory
+      try { briefing.learnings = reflect(this._memory); } catch {}
+
+      // Record snapshot for future trend analysis
+      try { this._memory.recordSnapshot(briefing); } catch {}
 
       this._cache = { briefing, generatedAt: Date.now(), scanning: false };
       return briefing;
@@ -383,8 +695,14 @@ class Jarvis {
   dismiss(insightId) {
     this._dismissed.add(insightId);
     setTimeout(() => this._dismissed.delete(insightId), 24 * 60 * 60 * 1000);
+    this._memory.recordDismissal(insightId);
     this.invalidateCache();
   }
+
+  // Expose memory for MCP and advanced integrations
+  getMemory() { return this._memory; }
+  getLearnings() { return this._memory.getRules(); }
+  forgetRule(ruleId) { this._memory.removeRule(ruleId); }
 
   attachRoutes(app, opts = {}) {
     const prefix = opts.prefix || "/api/jarvis";
@@ -416,27 +734,49 @@ class Jarvis {
       if (!project || !project.folder) return res.status(404).json({ error: "Project not found" });
 
       const cwd = project.folder;
+      const memory = this._memory;
+
+      // Check if this action has a learned unreliability warning
+      const unreliableRule = memory.getRules().find(r => r.type === "unreliable-action" && r.action === action);
+
       try {
+        // Risk assessment gate — block high-risk actions unless confirmed
+        const risk = await assessActionRisk(project, action);
+        if (risk.level === "high" && !req.body.confirmed) {
+          return res.json({ ok: false, requiresConfirmation: true, riskLevel: risk.level, reason: risk.reason,
+            warning: unreliableRule ? unreliableRule.reason : undefined });
+        }
+
         switch (action) {
           case "commit": {
             const status = await run("git", ["status", "--porcelain"], { cwd });
             const lines = status.split("\n").filter(Boolean);
+            memory.recordAction(sessionId, action, "success");
             res.json({ ok: true, message: `${lines.length} file${lines.length !== 1 ? "s" : ""} with uncommitted changes — commit from your terminal or IDE` });
             break;
           }
           case "push": {
+            if (risk.level !== "low" && !req.body.confirmed) {
+              return res.json({ ok: false, requiresConfirmation: true, riskLevel: risk.level, reason: risk.reason });
+            }
             const unpushed = await run("git", ["log", "@{u}..HEAD", "--oneline"], { cwd });
             const commits = unpushed.split("\n").filter(Boolean);
+            memory.recordAction(sessionId, action, "success");
             res.json({ ok: true, message: `${commits.length} unpushed commit${commits.length !== 1 ? "s" : ""} — push from your terminal when ready` });
             break;
           }
           case "branch": {
             const branch = await run("git", ["branch", "--show-current"], { cwd });
+            memory.recordAction(sessionId, action, "success");
             res.json({ ok: true, message: `Currently on branch "${branch}" — create a feature branch before committing` });
             break;
           }
           case "install": {
+            if (risk.level !== "low" && !req.body.confirmed) {
+              return res.json({ ok: false, requiresConfirmation: true, riskLevel: risk.level, reason: risk.reason });
+            }
             await run("npm", ["install"], { cwd, timeout: 60000 });
+            memory.recordAction(sessionId, action, "success");
             this.invalidateCache();
             res.json({ ok: true, message: "npm install completed successfully" });
             break;
@@ -444,6 +784,35 @@ class Jarvis {
           default:
             res.status(400).json({ error: `Unknown action: ${action}` });
         }
+      } catch (err) {
+        memory.recordAction(sessionId, action, "error");
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    // ── Memory & Learning routes ──
+
+    app.get(`${prefix}/learnings`, ...middlewares, (req, res) => {
+      res.json({ rules: this._memory.getRules(), stats: {
+        snapshots: this._memory.getSnapshots().length,
+        dismissals: this._memory.getDismissals().length,
+        actions: this._memory.getActions().length,
+      }});
+    });
+
+    app.post(`${prefix}/forget`, ...middlewares, (req, res) => {
+      const { ruleId } = req.body;
+      if (!ruleId) return res.status(400).json({ error: "ruleId required" });
+      this._memory.removeRule(ruleId);
+      this.invalidateCache();
+      res.json({ ok: true, message: `Rule "${ruleId}" removed` });
+    });
+
+    app.get(`${prefix}/trends`, ...middlewares, (req, res) => {
+      const briefing = this.getCachedBriefing();
+      if (!briefing) return res.json({ trends: [] });
+      try {
+        res.json({ trends: detectTrends(briefing, this._memory) });
       } catch (err) {
         res.status(500).json({ error: err.message });
       }

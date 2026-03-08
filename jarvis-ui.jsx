@@ -27,14 +27,21 @@
     const actionLabels = { commit: "View", push: "Push", branch: "Info", install: "Install" };
     const [actionResult, setActionResult] = useState(null);
     const [loading, setLoading] = useState(false);
+    const [pendingConfirm, setPendingConfirm] = useState(null); // { reason, riskLevel }
 
-    const handleAction = () => {
+    const handleAction = (confirmed = false) => {
       if (!onAction || !insight.action) return;
       setLoading(true);
-      onAction(insight.action).then(r => {
-        setActionResult(r?.message || (r?.error ? "Error: " + r.error : "Done"));
-        setLoading(false);
-        setTimeout(() => setActionResult(null), 5000);
+      onAction(insight.action, confirmed).then(r => {
+        if (r?.requiresConfirmation) {
+          setPendingConfirm({ reason: r.reason, riskLevel: r.riskLevel });
+          setLoading(false);
+        } else {
+          setPendingConfirm(null);
+          setActionResult(r?.message || (r?.error ? "Error: " + r.error : "Done"));
+          setLoading(false);
+          setTimeout(() => setActionResult(null), 5000);
+        }
       }).catch(() => { setLoading(false); });
     };
 
@@ -47,17 +54,33 @@
           <div style={{ fontWeight:600, color: sevColor[insight.severity] || sevColor.info }}>{insight.title}</div>
           {actionResult ? (
             <div style={{ color:"var(--grn, #4ade80)", fontSize:11, marginTop:1 }}>{actionResult}</div>
+          ) : pendingConfirm ? (
+            <div style={{ color:"var(--amb)", fontSize:11, marginTop:1 }}>⚠ {pendingConfirm.reason}</div>
           ) : insight.detail && (
             <div style={{ color:"var(--txt3)", fontSize:11, marginTop:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{insight.detail}</div>
           )}
         </div>
-        {insight.action && onAction && (
-          <button onClick={handleAction} disabled={loading}
+        {insight.action && onAction && !pendingConfirm && (
+          <button onClick={() => handleAction(false)} disabled={loading}
             style={{ background:"var(--accBg)", border:"1px solid var(--acc)", color:"var(--acc)",
               cursor: loading ? "wait" : "pointer", padding:"2px 8px", fontSize:10, fontWeight:600, borderRadius:5, flexShrink:0,
               opacity: loading ? 0.5 : 1, transition:"all .15s" }}>
             {loading ? "..." : actionLabels[insight.action] || insight.action}
           </button>
+        )}
+        {pendingConfirm && (
+          <div style={{ display:"flex", gap:4, flexShrink:0 }}>
+            <button onClick={() => handleAction(true)} disabled={loading}
+              style={{ background:"var(--ambBg)", border:"1px solid var(--amb)", color:"var(--amb)",
+                cursor:"pointer", padding:"2px 8px", fontSize:10, fontWeight:600, borderRadius:5 }}>
+              {loading ? "..." : "Confirm"}
+            </button>
+            <button onClick={() => setPendingConfirm(null)}
+              style={{ background:"transparent", border:"1px solid var(--glass-border)", color:"var(--txt4)",
+                cursor:"pointer", padding:"2px 8px", fontSize:10, fontWeight:600, borderRadius:5 }}>
+              Cancel
+            </button>
+          </div>
         )}
         {onDismiss && <button onClick={() => onDismiss(insight.id)} style={{ background:"transparent", border:"none", color:"var(--txt4)",
           cursor:"pointer", padding:2, fontSize:14, lineHeight:1, flexShrink:0 }} title="Dismiss">{"\u00D7"}</button>}
@@ -538,7 +561,7 @@
                     Needs Attention
                   </div>
                   {criticalInsights.map(i => <InsightCard key={i.id} insight={i} onDismiss={onDismissInsight}
-                    onAction={i.action && i.sessionId && onAction ? (action) => onAction(i.sessionId, action) : null}/>)}
+                    onAction={i.action && i.sessionId && onAction ? (action, confirmed) => onAction(i.sessionId, action, confirmed) : null}/>)}
                 </div>
               )}
 
@@ -559,7 +582,7 @@
                     Insights ({otherInsights.length})
                   </div>
                   {otherInsights.slice(0, 4).map(i => <InsightCard key={i.id} insight={i} onDismiss={onDismissInsight}
-                    onAction={i.action && i.sessionId && onAction ? (action) => onAction(i.sessionId, action) : null}/>)}
+                    onAction={i.action && i.sessionId && onAction ? (action, confirmed) => onAction(i.sessionId, action, confirmed) : null}/>)}
                   {otherInsights.length > 4 && (
                     <div style={{ fontSize:11, color:"var(--txt4)", paddingLeft:4 }}>+{otherInsights.length - 4} more</div>
                   )}
@@ -697,10 +720,10 @@
       if (msg.briefing) setBriefing(msg.briefing);
     }, []);
 
-    const executeAction = useCallback((sessionId, action) => {
+    const executeAction = useCallback((sessionId, action, confirmed = false) => {
       const headers = { "Content-Type": "application/json" };
       if (getAuthToken) headers.Authorization = `Bearer ${getAuthToken()}`;
-      return fetch(`${apiBase}/api/jarvis/action`, { method: "POST", headers, body: JSON.stringify({ sessionId, action }) })
+      return fetch(`${apiBase}/api/jarvis/action`, { method: "POST", headers, body: JSON.stringify({ sessionId, action, confirmed }) })
         .then(r => r.json())
         .then(d => {
           if (d.ok) fetchBriefing(true);

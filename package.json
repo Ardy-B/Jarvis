@@ -4,5 +4,23 @@
   "description": "Proactive project assistant — content-aware briefings, git analysis, security scanning",
   "main": "jarvis.js",
   "license": "MIT",
-  "keywords": ["jarvis", "project-assistant", "git-analysis", "briefing"]
+  "keywords": [
+    "jarvis",
+    "project-assistant",
+    "git-analysis",
+    "briefing"
+  ],
+  "peerDependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "express": ">=4.0.0",
+    "zod": "^4.3.6"
+  },
+  "peerDependenciesMeta": {
+    "@modelcontextprotocol/sdk": {
+      "optional": true
+    },
+    "zod": {
+      "optional": true
+    }
+  }
 }

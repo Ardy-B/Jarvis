@@ -1,3 +1,5 @@
 node_modules/
 .DS_Store
 *.log
+.jarvis/
+Claude_Power_User_Companion_v2.txt
