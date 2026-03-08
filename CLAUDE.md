@@ -23,6 +23,9 @@ jarvis-mcp.mjs → Optional MCP server: exposes briefing, learnings, trends as C
 - **Trend Detection**: Compares current scan against 24h-ago baseline — surfaces new/resolved issues
 - **Reflection Engine**: Analyzes dismissal patterns → auto-suppresses false positives (3+ dismissals)
 - **Safety Gates**: Risk assessment on actions — blocks high-risk ops (e.g., push to main) without confirmation
+- **Workflow Engine**: `JarvisWorkflow` — selects analysis recipe per project (security-deep, team-full, solo-quick, etc.)
+- **Hook Manager**: `JarvisHookManager` — reads/writes .claude/settings.json; auto-optimizes hooks from learned patterns
+- **Agent Manager**: `JarvisAgentManager` — maintains .claude/agents/ definitions; auto-writes on startup; recommends agents per project
 
 ## Integration Pattern
 ```js
@@ -45,12 +48,20 @@ jarvis.setProjects([...]); // host provides project data
 - DO NOT store session data — host provides project data via setProjects()
 
 ## API Routes
-- `GET  /briefing`   → full briefing with trends and learnings
-- `POST /dismiss`    → dismiss insight (recorded to memory for learning)
-- `POST /action`     → execute action with risk gate
-- `GET  /learnings`  → view learned rules and memory stats
-- `POST /forget`     → remove a learned rule by ID
-- `GET  /trends`     → trend analysis from historical snapshots
+- `GET  /briefing`          → full briefing with trends, learnings, and per-session workflow + recommendedAgents
+- `POST /dismiss`           → dismiss insight (recorded to memory for learning)
+- `POST /action`            → execute action with risk gate
+- `GET  /learnings`         → view learned rules and memory stats
+- `POST /forget`            → remove a learned rule by ID
+- `GET  /trends`            → trend analysis from historical snapshots
+- `GET  /workflows`         → list all workflow recipes (name, tasks, extras, parallel flag)
+- `GET  /hooks`             → view current .claude/settings.json hooks
+- `POST /hooks/optimize`    → auto-optimize hooks based on memory patterns (idempotent)
+- `POST /hooks/add`         → manually add a hook (event, matcher, command, id)
+- `DELETE /hooks/:id`       → remove a hook by id (pass ?event= query param)
+- `GET  /agents`            → list specialized subagent definitions and their on-disk status
+- `POST /agents/ensure`     → re-write any missing agent definition files to .claude/agents/
+- `POST /agents/recommend`  → recommend specialized agents for a session (pass sessionId)
 
 ## Gotchas
 - Frontend uses host CSS variables (--glass, --txt, --red, etc.) — undefined vars = broken UI

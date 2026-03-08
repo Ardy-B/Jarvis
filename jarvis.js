@@ -776,6 +776,375 @@ function shouldSuppress(insightId, memory) {
   return rules.some(r => r.pattern === pattern);
 }
 
+// ── Workflow Engine ───────────────────────────────────────────────────────────
+//
+// Dynamically selects an analysis recipe based on project personality/context.
+// Recipes are evaluated in priority order — first match wins.
+
+const WORKFLOW_RECIPES = {
+  "security-deep": {
+    description: "Deep security audit for auth-sensitive projects (git + full security + context)",
+    tasks: ["git", "code", "security", "context", "type-specific"],
+    extras: ["security-deep-agent"],
+    parallel: true,
+    condition: p => p.personality && p.personality.isAuthSensitive,
+  },
+  "maintenance-minimal": {
+    description: "Minimal scan for maintenance-mode projects (security + context only)",
+    tasks: ["security", "context"],
+    extras: [],
+    parallel: true,
+    condition: p => p.personality && p.personality.isMaintenance,
+  },
+  "performance-focus": {
+    description: "Performance-focused scan for React/Next.js projects",
+    tasks: ["git", "code", "security", "context", "type-specific"],
+    extras: ["performance-audit-agent"],
+    parallel: true,
+    condition: p => p.context && (p.context.stack || []).some(s => s === "React" || s === "Next.js"),
+  },
+  "team-full": {
+    description: "Full team scan — all analyzers in parallel",
+    tasks: ["git", "code", "security", "context", "type-specific"],
+    extras: ["dependency-graph-agent"],
+    parallel: true,
+    condition: p => p.personality && !p.personality.isSolo,
+  },
+  "solo-quick": {
+    description: "Fast scan for solo developers — git + security only",
+    tasks: ["git", "security"],
+    extras: [],
+    parallel: true,
+    condition: p => p.personality && p.personality.isSolo,
+  },
+  "standard": {
+    description: "Balanced scan — git, code, security, context",
+    tasks: ["git", "code", "security", "context", "type-specific"],
+    extras: [],
+    parallel: true,
+    condition: () => true,
+  },
+};
+
+class JarvisWorkflow {
+  /** Return the first matching recipe for the given project state. */
+  selectRecipe(personality, context) {
+    const ctx = { personality, context };
+    const priority = ["security-deep", "maintenance-minimal", "performance-focus", "team-full", "solo-quick", "standard"];
+    for (const name of priority) {
+      const r = WORKFLOW_RECIPES[name];
+      if (r.condition(ctx)) return { name, ...r };
+    }
+    return { name: "standard", ...WORKFLOW_RECIPES.standard };
+  }
+
+  /** Return all recipes as a plain list for the /workflows API. */
+  listRecipes() {
+    return Object.entries(WORKFLOW_RECIPES).map(([name, r]) => ({
+      name,
+      description: r.description,
+      tasks: r.tasks,
+      extras: r.extras,
+      parallel: r.parallel,
+    }));
+  }
+}
+
+// ── Hook Manager ──────────────────────────────────────────────────────────────
+//
+// Reads/writes .claude/settings.json hooks. Can auto-optimize hooks based on
+// patterns learned from memory (e.g., add pre-push warning after repeated failures).
+
+class JarvisHookManager {
+  constructor(settingsPath) {
+    this._path = settingsPath;
+  }
+
+  _read() {
+    try {
+      if (!fs.existsSync(this._path)) return { hooks: {} };
+      return JSON.parse(fs.readFileSync(this._path, "utf8"));
+    } catch { return { hooks: {} }; }
+  }
+
+  _write(settings) {
+    try {
+      const dir = path.dirname(this._path);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(this._path, JSON.stringify(settings, null, 2) + "\n");
+      return true;
+    } catch { return false; }
+  }
+
+  getHooks() { return this._read().hooks || {}; }
+
+  /** Add a hook if one with the same _id does not already exist. Returns true if added. */
+  addHook(event, matcher, command, id) {
+    const settings = this._read();
+    if (!settings.hooks) settings.hooks = {};
+    if (!settings.hooks[event]) settings.hooks[event] = [];
+    if (settings.hooks[event].some(h => h._id === id)) return false;
+    settings.hooks[event].push({ _id: id, matcher, hooks: [{ type: "command", command }] });
+    return this._write(settings);
+  }
+
+  /** Remove a hook by its _id. Returns true if removed. */
+  removeHook(event, id) {
+    const settings = this._read();
+    if (!settings.hooks?.[event]) return false;
+    const before = settings.hooks[event].length;
+    settings.hooks[event] = settings.hooks[event].filter(h => h._id !== id);
+    if (settings.hooks[event].length === before) return false;
+    return this._write(settings);
+  }
+
+  /**
+   * Analyze memory patterns and auto-optimize hooks.
+   * Returns an array of { action, hook, reason } change records.
+   */
+  autoOptimize(memory) {
+    const changes = [];
+    const rules   = memory.getRules  ? memory.getRules()   : [];
+    const actions = memory.getActions ? memory.getActions() : [];
+
+    // If push has been unreliable (>50% fail) → add a pre-push advisory hook
+    const pushActions = actions.filter(a => a.action === "push");
+    const pushFails   = pushActions.filter(a => a.outcome !== "success").length;
+    const unreliablePushRule = rules.find(r => r.type === "unreliable-action" && r.action === "push");
+    if (unreliablePushRule && (unreliablePushRule.confidence || 0) >= 0.7) {
+      const added = this.addHook(
+        "PreToolUse", "Bash",
+        "echo '⚠️  Jarvis: push operations have been unreliable — verify remote is accessible' >&2",
+        "jarvis-unreliable-push-warning"
+      );
+      if (added) changes.push({ action: "added", hook: "jarvis-unreliable-push-warning", reason: "unreliable push pattern detected" });
+    }
+
+    // If commit failures have happened 3+ times → ensure syntax check hook exists
+    const commitFails = actions.filter(a => a.action === "commit" && a.outcome !== "success").length;
+    if (commitFails >= 3) {
+      const added = this.addHook(
+        "PostToolUse", "Edit|Write",
+        "node -e \"require('./jarvis')\" 2>&1 | grep -q 'SyntaxError' && echo '✗ jarvis.js has a syntax error' >&2 || true",
+        "jarvis-syntax-check"
+      );
+      if (added) changes.push({ action: "added", hook: "jarvis-syntax-check", reason: "repeated commit failures suggest syntax errors" });
+    }
+
+    // Silence push warning once push reliability recovers (≥ 80% success over last 10)
+    const recentPush = pushActions.slice(-10);
+    const recentOk   = recentPush.filter(a => a.outcome === "success").length;
+    if (recentPush.length >= 10 && recentOk / recentPush.length >= 0.8) {
+      const removed = this.removeHook("PreToolUse", "jarvis-unreliable-push-warning");
+      if (removed) changes.push({ action: "removed", hook: "jarvis-unreliable-push-warning", reason: "push reliability has recovered" });
+    }
+
+    return changes;
+  }
+}
+
+// ── Agent Manager ─────────────────────────────────────────────────────────────
+//
+// Maintains a catalogue of specialized subagent definitions and writes their
+// .claude/agents/*.md files so Claude Code can spawn them on demand.
+// Jarvis calls ensureAgents() at startup — idempotent (only writes missing files).
+
+const AGENT_SPECS = {
+  "security-deep": {
+    name: "Jarvis Security Deep Audit Agent",
+    description: "Deep security scan: exposed secrets, auth-flow review, CORS audit, env config",
+    file: "security-deep.md",
+    triggers: ["isAuthSensitive"],
+  },
+  "dependency-graph": {
+    name: "Jarvis Dependency Graph Agent",
+    description: "Dependency tree analysis: wrong categories, duplicate capabilities, missing scripts",
+    file: "dependency-graph.md",
+    triggers: ["hasPackageJson"],
+  },
+  "performance-audit": {
+    name: "Jarvis Performance Audit Agent",
+    description: "Frontend performance review: bundle size, re-render patterns, Next.js specifics",
+    file: "performance-audit.md",
+    triggers: ["isReact", "isNextJs"],
+  },
+};
+
+class JarvisAgentManager {
+  constructor(agentsDir) {
+    this._dir = agentsDir;
+  }
+
+  /** Write agent definition files that don't exist yet. Idempotent. */
+  ensureAgents() {
+    try {
+      if (!fs.existsSync(this._dir)) fs.mkdirSync(this._dir, { recursive: true });
+    } catch { return; }
+
+    const defs = {
+      "security-deep.md":   this._securityDeepMd(),
+      "dependency-graph.md": this._dependencyGraphMd(),
+      "performance-audit.md": this._performanceAuditMd(),
+    };
+
+    for (const [filename, content] of Object.entries(defs)) {
+      const p = path.join(this._dir, filename);
+      try { if (!fs.existsSync(p)) fs.writeFileSync(p, content); } catch {}
+    }
+  }
+
+  /** Return which agents are relevant for a project given its personality and context. */
+  selectAgentsForProject(personality, context) {
+    const stack = (context && context.stack) || [];
+    const active = [];
+    if (personality && personality.isAuthSensitive) active.push("security-deep");
+    if (context && context.hasPackageJson)           active.push("dependency-graph");
+    if (stack.includes("React") || stack.includes("Next.js")) active.push("performance-audit");
+    return active.map(id => ({ id, ...AGENT_SPECS[id] }));
+  }
+
+  /** List all known agents with their on-disk status. */
+  listAgents() {
+    return Object.entries(AGENT_SPECS).map(([id, spec]) => ({
+      id,
+      name: spec.name,
+      description: spec.description,
+      triggers: spec.triggers,
+      exists: fs.existsSync(path.join(this._dir, spec.file)),
+    }));
+  }
+
+  _securityDeepMd() {
+    return `# Jarvis Security Deep Audit Agent
+
+You are a specialized security audit subagent deployed by Jarvis for auth-sensitive projects.
+
+## Mission
+Perform a thorough security audit and return a structured findings report.
+
+## Steps
+
+1. **Scan for exposed secrets**: Search all source files for API keys, JWT secrets, database URLs, private keys.
+   Use patterns like \`(api[_-]?key|secret|password|token|private[_-]?key)\\s*[:=]\\s*["'][^"']{8,}\`
+
+2. **Audit authentication flow**: Read auth-related files (auth.js, middleware/*.js, routes/auth*, etc.)
+   Check for: insecure session config, missing rate limiting, plain-text password comparison, missing HTTPS enforcement.
+
+3. **Check dependency vulnerabilities**: If npm is available, run \`npm audit --json\` and parse for high/critical issues.
+
+4. **Review environment configuration**: Check .env.example vs .env, ensure sensitive values are not committed.
+
+5. **Check CORS and security headers**: Look for \`Access-Control-Allow-Origin: *\` in production configs.
+
+## Output Format
+
+Return a JSON object:
+\`\`\`json
+{
+  "severity": "critical|high|medium|low",
+  "findings": [
+    { "type": "exposed-secret|weak-auth|vulnerable-dep|config-issue|cors-issue", "file": "path", "line": 0, "detail": "..." }
+  ],
+  "summary": "one-sentence summary"
+}
+\`\`\`
+
+## Constraints
+- Never modify files — read-only audit
+- Do not run npm install or any write operations
+- If no issues found, return severity: "low" with empty findings
+`;
+  }
+
+  _dependencyGraphMd() {
+    return `# Jarvis Dependency Graph Agent
+
+You are a specialized dependency analysis subagent deployed by Jarvis.
+
+## Mission
+Analyze the dependency tree and return actionable package management insights.
+
+## Steps
+
+1. **Read package.json**: Parse all dependencies and devDependencies, note version constraint styles.
+
+2. **Check for known problematic patterns**:
+   - Missing \`engines\` field (Node.js version compatibility unknown)
+   - Build tools in \`dependencies\` instead of \`devDependencies\` (e.g., typescript, eslint, vite)
+   - Multiple packages serving the same purpose (e.g., axios + node-fetch + got; moment + date-fns + dayjs)
+   - All pinned versions = update-resistant; all flexible = instability risk
+
+3. **Review scripts**: Check for missing lint, test, build, typecheck scripts.
+
+4. **Flag large bundles**: Identify packages known to be large (e.g., lodash without tree-shaking, moment.js).
+
+## Output Format
+
+\`\`\`json
+{
+  "totalDeps": 0,
+  "issues": [
+    { "type": "wrong-category|duplicate-capability|missing-engine|missing-scripts|large-bundle", "packages": [], "recommendation": "..." }
+  ],
+  "summary": "one-sentence summary"
+}
+\`\`\`
+
+## Constraints
+- Read-only analysis from package.json and source files only
+- Do not run npm install, npm audit, or any shell commands
+`;
+  }
+
+  _performanceAuditMd() {
+    return `# Jarvis Performance Audit Agent
+
+You are a specialized performance audit subagent deployed by Jarvis for React/Next.js projects.
+
+## Mission
+Identify frontend performance issues and return prioritized recommendations.
+
+## Steps
+
+1. **Bundle size risks**: Look for large library imports without tree-shaking
+   (e.g., \`import _ from 'lodash'\` instead of \`import pick from 'lodash/pick'\`)
+
+2. **React rendering issues**:
+   - Missing \`key\` props in list renders
+   - Inline function/object creation in JSX props (causes unnecessary re-renders)
+   - Large components that could benefit from \`React.memo\`
+   - Event handlers missing \`useCallback\` when passed to child components
+
+3. **Next.js specific** (if applicable):
+   - Images not using \`next/image\`
+   - Large client components that could be server components
+   - Missing \`generateStaticParams\` for dynamic routes that could be static
+   - Mixed App Router and Pages Router usage
+
+4. **Data fetching patterns**:
+   - N+1 query patterns (loops with await inside)
+   - Missing loading / error states
+   - No caching strategy for repeated fetches
+
+## Output Format
+
+\`\`\`json
+{
+  "impact": "high|medium|low",
+  "issues": [
+    { "type": "bundle|rendering|nextjs|data-fetching", "file": "path", "detail": "...", "fix": "..." }
+  ],
+  "summary": "one-sentence summary"
+}
+\`\`\`
+
+## Constraints
+- Read-only analysis
+- Focus only on performance — security issues belong to the security-deep agent
+`;
+  }
+}
+
 // ── Jarvis Class ─────────────────────────────────────────────────────────────
 
 class Jarvis {
@@ -790,6 +1159,15 @@ class Jarvis {
     // Memory — stored alongside jarvis.js by default, or configurable
     const memDir = opts.memoryPath || path.join(path.dirname(__filename), ".jarvis");
     this._memory = new JarvisMemory(path.join(memDir, "memory.json"));
+
+    // Workflow, hook, and agent systems — rootDir defaults to the jarvis.js directory
+    const rootDir = opts.rootDir || path.dirname(__filename);
+    this._workflow  = new JarvisWorkflow();
+    this._hookMgr   = new JarvisHookManager(path.join(rootDir, ".claude", "settings.json"));
+    this._agentMgr  = new JarvisAgentManager(path.join(rootDir, ".claude", "agents"));
+
+    // Auto-write agent definition files on startup (idempotent)
+    try { this._agentMgr.ensureAgents(); } catch {}
   }
 
   setProjects(projects) { this._projects = projects || []; }
@@ -850,6 +1228,9 @@ class Jarvis {
             const m = i.title.match(/^(\d+)/); return m ? parseInt(m[1]) : n;
           }, 0);
 
+          // Select the best workflow recipe for observability / UI display
+          const recipe = this._workflow.selectRecipe(personality, projectContext);
+
           sessionResults.push({
             id: p.id, name: p.name, status: p.status,
             lastActivityAt: recap.lastActivityAt,
@@ -857,6 +1238,8 @@ class Jarvis {
             lastAssistantMessage: recap.lastAssistantMessage,
             git: { branch, uncommittedCount, unpushedCount },
             insights: allInsights, context: projectContext, personality,
+            workflow: recipe.name,
+            recommendedAgents: this._agentMgr.selectAgentsForProject(personality, projectContext).map(a => a.id),
           });
         } catch {}
       }
@@ -1092,6 +1475,75 @@ class Jarvis {
       } catch (err) {
         res.status(500).json({ error: err.message });
       }
+    });
+
+    // ── Workflow routes ──
+
+    app.get(`${prefix}/workflows`, ...middlewares, (req, res) => {
+      res.json({ workflows: this._workflow.listRecipes() });
+    });
+
+    // ── Hook management routes ──
+
+    app.get(`${prefix}/hooks`, ...middlewares, (req, res) => {
+      res.json({ hooks: this._hookMgr.getHooks() });
+    });
+
+    app.post(`${prefix}/hooks/optimize`, ...middlewares, (req, res) => {
+      try {
+        const changes = this._hookMgr.autoOptimize(this._memory);
+        res.json({ ok: true, changes, message: changes.length > 0
+          ? `${changes.length} hook change${changes.length !== 1 ? "s" : ""} applied`
+          : "No hook changes needed" });
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    app.post(`${prefix}/hooks/add`, ...middlewares, (req, res) => {
+      const { event, matcher, command, id } = req.body;
+      if (!event || !command || !id) return res.status(400).json({ error: "event, command, and id required" });
+      const added = this._hookMgr.addHook(event, matcher || "", command, id);
+      res.json({ ok: true, added, message: added ? `Hook "${id}" added to ${event}` : `Hook "${id}" already exists` });
+    });
+
+    app.delete(`${prefix}/hooks/:id`, ...middlewares, (req, res) => {
+      const { event } = req.query;
+      const { id } = req.params;
+      if (!event) return res.status(400).json({ error: "event query param required" });
+      const removed = this._hookMgr.removeHook(event, id);
+      res.json({ ok: true, removed, message: removed ? `Hook "${id}" removed` : `Hook "${id}" not found in ${event}` });
+    });
+
+    // ── Agent management routes ──
+
+    app.get(`${prefix}/agents`, ...middlewares, (req, res) => {
+      res.json({ agents: this._agentMgr.listAgents() });
+    });
+
+    app.post(`${prefix}/agents/ensure`, ...middlewares, (req, res) => {
+      try {
+        this._agentMgr.ensureAgents();
+        res.json({ ok: true, message: "Agent definition files ensured", agents: this._agentMgr.listAgents() });
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    app.post(`${prefix}/agents/recommend`, ...middlewares, (req, res) => {
+      const { sessionId } = req.body;
+      if (!sessionId) return res.status(400).json({ error: "sessionId required" });
+      const session = this._cache.briefing?.sessions?.find(s => s.id === sessionId);
+      if (!session) return res.status(404).json({ error: "Session not found in cached briefing" });
+      const agents = this._agentMgr.selectAgentsForProject(session.personality, session.context);
+      const project = this._projects.find(p => p.id === sessionId);
+      res.json({
+        agents,
+        workflow: session.workflow,
+        message: agents.length > 0
+          ? `${agents.length} specialized agent${agents.length !== 1 ? "s" : ""} recommended for ${project?.name || sessionId}`
+          : "Standard workflow — no specialized agents needed for this project",
+      });
     });
   }
 }
