@@ -489,6 +489,243 @@ function analyzeNextJsHealth(project, context) {
   return insights;
 }
 
+// ── Advanced Analyzers ───────────────────────────────────────────────────────
+
+/** Git commit velocity: commits/week last 4 weeks vs prior 4 weeks */
+async function analyzeGitVelocity(project) {
+  if (!project.folder || !project.isGit) return { insights: [], weeklyRate: null, trend: null };
+  const cwd = project.folder;
+  try {
+    const raw = await run("git", ["log", "--format=%ct", "--since=8 weeks ago"], { cwd });
+    const timestamps = raw.split("\n").filter(Boolean).map(Number).filter(Boolean);
+    if (timestamps.length === 0) return { insights: [], weeklyRate: null, trend: null };
+
+    const nowSec = Date.now() / 1000;
+    const fourWeeksAgo  = nowSec - 28 * 24 * 3600;
+    const eightWeeksAgo = nowSec - 56 * 24 * 3600;
+
+    const recent = timestamps.filter(t => t >= fourWeeksAgo).length;
+    const prior  = timestamps.filter(t => t >= eightWeeksAgo && t < fourWeeksAgo).length;
+    const recentRate = recent / 4;
+    const priorRate  = prior  / 4;
+
+    let trend = "stable";
+    if (priorRate > 0 && recentRate < priorRate * 0.5) trend = "down";
+    else if (priorRate > 0 && recentRate > priorRate * 1.5) trend = "up";
+    else if (priorRate === 0 && recentRate > 0) trend = "up";
+
+    const insights = [];
+    if (trend === "down" && prior >= 4) {
+      insights.push({
+        id: `git-velocity-drop-${project.id}`, type: "git", severity: "warning",
+        title: "Commit velocity dropping",
+        detail: `${recentRate.toFixed(1)}/wk (last 4wk) vs ${priorRate.toFixed(1)}/wk (prior 4wk)`,
+      });
+    }
+    return { insights, weeklyRate: parseFloat(recentRate.toFixed(2)), trend };
+  } catch {
+    return { insights: [], weeklyRate: null, trend: null };
+  }
+}
+
+/** Flag low-quality commit messages: too short or matching known throwaway patterns */
+async function analyzeCommitQuality(project) {
+  const insights = [];
+  if (!project.folder || !project.isGit) return insights;
+  const cwd = project.folder;
+  try {
+    const raw = await run("git", ["log", "--format=%s", "-20"], { cwd });
+    const messages = raw.split("\n").filter(Boolean);
+    const badRe = /^(wip|fix|temp|tmp|test|asdf|\.+|todo|update|changes|stuff|misc)$/i;
+    const bad = messages.filter(m => m.length < 10 || badRe.test(m.trim()));
+    if (bad.length >= 2) {
+      insights.push({
+        id: `commit-quality-${project.id}`, type: "git", severity: "info",
+        title: `${bad.length} low-quality commit message${bad.length > 1 ? "s" : ""} in recent history`,
+        detail: bad.slice(0, 3).map(m => `"${m.slice(0, 30)}"`).join(", "),
+      });
+    }
+  } catch {}
+  return insights;
+}
+
+/** Scan src/ (max 2 levels) for source files over 500 lines — flag top offender */
+function analyzeGodFiles(project) {
+  const insights = [];
+  if (!project.folder) return insights;
+  const cwd = project.folder;
+  const srcDir = path.join(cwd, "src");
+  if (!fs.existsSync(srcDir)) return insights;
+  try {
+    const candidates = [];
+    const CODE_EXT = /\.(js|ts|jsx|tsx|py|go|java|cs|rb|php)$/;
+    const isFile = f => { try { return fs.statSync(f).isFile(); } catch { return false; } };
+    const scan = (dir, depth) => {
+      if (depth > 2) return;
+      let entries;
+      try { entries = fs.readdirSync(dir); } catch { return; }
+      for (const e of entries) {
+        if (e.startsWith(".") || e === "node_modules") continue;
+        const full = path.join(dir, e);
+        if (isFile(full) && CODE_EXT.test(e)) {
+          try {
+            const lines = fs.readFileSync(full, "utf8").split("\n").length;
+            if (lines > 500) candidates.push({ file: path.relative(cwd, full), lines });
+          } catch {}
+        } else if (!isFile(full)) {
+          scan(full, depth + 1);
+        }
+      }
+    };
+    scan(srcDir, 1);
+    if (candidates.length > 0) {
+      candidates.sort((a, b) => b.lines - a.lines);
+      const top = candidates[0];
+      insights.push({
+        id: `god-file-${project.id}`, type: "health", severity: "warning",
+        title: `${candidates.length} oversized file${candidates.length > 1 ? "s" : ""} in src/ (>500 lines)`,
+        detail: `${top.file} — ${top.lines} lines. Consider splitting into smaller modules.`,
+      });
+    }
+  } catch {}
+  return insights;
+}
+
+/** Check recently changed src/ files for missing .test or .spec counterparts */
+async function analyzeTestGap(project) {
+  const insights = [];
+  if (!project.folder || !project.isGit) return insights;
+  const cwd = project.folder;
+  try {
+    const raw = await run("git", ["diff", "--name-only", "HEAD~3..HEAD"], { cwd });
+    const srcFiles = raw.split("\n").filter(f => f && f.startsWith("src/") && /\.(js|ts|jsx|tsx)$/.test(f) && !/\.(test|spec)\./.test(f));
+    const missing = [];
+    for (const f of srcFiles.slice(0, 8)) {
+      const ext = path.extname(f);
+      const base = f.slice(0, f.length - ext.length);
+      const hasTest = [
+        `${base}.test${ext}`, `${base}.spec${ext}`,
+        f.replace(/^src\//, "src/__tests__/"),
+        f.replace(/^src\//, "test/"),
+      ].some(tv => fs.existsSync(path.join(cwd, tv)));
+      if (!hasTest) missing.push(f);
+    }
+    if (missing.length > 0) {
+      insights.push({
+        id: `test-gap-${project.id}`, type: "health", severity: "info",
+        title: `${missing.length} recently changed file${missing.length > 1 ? "s" : ""} with no test`,
+        detail: missing.slice(0, 3).join(", ") + (missing.length > 3 ? ` +${missing.length - 3} more` : ""),
+      });
+    }
+  } catch {}
+  return insights;
+}
+
+/** Read package.json deps and check which are never imported in src/ source files */
+function analyzeUnusedDeps(project) {
+  const insights = [];
+  if (!project.folder) return insights;
+  const cwd = project.folder;
+  const CLI_DEPS = new Set(["husky", "dotenv-cli", "rimraf", "cross-env", "concurrently",
+    "npm-run-all", "onchange", "nodemon", "ts-node", "ts-node-dev", "tsc-alias", "lint-staged"]);
+  try {
+    const pkgPath = path.join(cwd, "package.json");
+    if (!fs.existsSync(pkgPath)) return insights;
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+    const deps = Object.keys(pkg.dependencies || {});
+    if (deps.length === 0) return insights;
+
+    // Collect source file contents
+    let srcContent = "";
+    const isFile = f => { try { return fs.statSync(f).isFile(); } catch { return false; } };
+    const collectDir = (dir, depth) => {
+      if (depth > 2) return;
+      let entries;
+      try { entries = fs.readdirSync(dir); } catch { return; }
+      for (const e of entries) {
+        if (e.startsWith(".") || e === "node_modules") continue;
+        const full = path.join(dir, e);
+        if (isFile(full) && /\.(js|ts|jsx|tsx)$/.test(e)) {
+          try { srcContent += fs.readFileSync(full, "utf8").slice(0, 6000) + "\n"; } catch {}
+        } else if (!isFile(full)) collectDir(full, depth + 1);
+      }
+    };
+    const srcDir = path.join(cwd, "src");
+    if (fs.existsSync(srcDir)) collectDir(srcDir, 1);
+    // Also scan top-level JS/TS files
+    try {
+      for (const f of fs.readdirSync(cwd).filter(f => isFile(path.join(cwd, f)) && /\.(js|ts|jsx|tsx)$/.test(f))) {
+        try { srcContent += fs.readFileSync(path.join(cwd, f), "utf8").slice(0, 4000) + "\n"; } catch {}
+      }
+    } catch {}
+    if (!srcContent) return insights;
+
+    const unused = deps.filter(dep => {
+      if (CLI_DEPS.has(dep)) return false;
+      const esc = dep.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return !new RegExp(`(?:require\\(['"]|from\\s+['"])${esc}(?:[/"']|['"])`).test(srcContent);
+    });
+    if (unused.length > 0) {
+      insights.push({
+        id: `unused-deps-${project.id}`, type: "health", severity: "info",
+        title: `${unused.length} possibly unused dep${unused.length > 1 ? "s" : ""} in package.json`,
+        detail: unused.slice(0, 4).join(", ") + (unused.length > 4 ? ` +${unused.length - 4} more` : ""),
+      });
+    }
+  } catch {}
+  return insights;
+}
+
+/** Compare .env.example keys against .env — flag any required keys that are missing */
+function analyzeEnvSchema(project) {
+  const insights = [];
+  if (!project.folder) return insights;
+  const cwd = project.folder;
+  try {
+    const exPath = path.join(cwd, ".env.example");
+    const envPath = path.join(cwd, ".env");
+    if (!fs.existsSync(exPath) || !fs.existsSync(envPath)) return insights;
+    const parseKeys = content => new Set(
+      content.split("\n").filter(l => l.trim() && !l.trim().startsWith("#"))
+        .map(l => l.split("=")[0].trim()).filter(Boolean)
+    );
+    const exampleKeys = parseKeys(fs.readFileSync(exPath, "utf8"));
+    const envKeys     = parseKeys(fs.readFileSync(envPath, "utf8"));
+    const missing = [...exampleKeys].filter(k => !envKeys.has(k));
+    if (missing.length > 0) {
+      insights.push({
+        id: `env-schema-${project.id}`, type: "security", severity: "warning",
+        title: `${missing.length} required env var${missing.length > 1 ? "s" : ""} not set in .env`,
+        detail: `From .env.example: ${missing.slice(0, 4).join(", ")}${missing.length > 4 ? ` +${missing.length - 4} more` : ""}`,
+      });
+    }
+  } catch {}
+  return insights;
+}
+
+/** Flag projects where one author wrote >80% of the last 100 commits (bus factor risk) */
+async function analyzeBusFactor(project) {
+  const insights = [];
+  if (!project.folder || !project.isGit) return insights;
+  const cwd = project.folder;
+  try {
+    const raw = await run("git", ["log", "--format=%ae", "-100"], { cwd });
+    const emails = raw.split("\n").filter(Boolean);
+    if (emails.length < 10) return insights;
+    const counts = {};
+    for (const e of emails) counts[e] = (counts[e] || 0) + 1;
+    const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+    if (top && top[1] / emails.length > 0.8) {
+      insights.push({
+        id: `bus-factor-${project.id}`, type: "health", severity: "warning",
+        title: "Bus factor: 1 — single author dominates",
+        detail: `${Math.round(top[1] / emails.length * 100)}% of recent commits by one author`,
+      });
+    }
+  } catch {}
+  return insights;
+}
+
 /** Post-process insights based on project context and personality */
 function adaptInsightsForContext(insights, context, personality) {
   return insights.map(insight => {
@@ -515,6 +752,49 @@ function adaptInsightsForContext(insights, context, personality) {
 
     return insight;
   }).filter(Boolean);
+}
+
+// ── Insight Scoring, Grouping & Health Score ─────────────────────────────────
+
+/** Compute a 0-100 health score for a project session. */
+function computeHealthScore(insights, context, personality) {
+  let score = 100;
+  for (const i of insights) {
+    if (i.severity === "error")        score -= 20;
+    else if (i.severity === "warning") score -= 10;
+    else if (i.severity === "info")    score -= 2;
+  }
+  if (context?.hasClaude) score += 5;
+  if (context?.hasTests)  score += 5;
+  return Math.max(0, Math.min(100, score));
+}
+
+/** Add a numeric priority field (0-10) to an insight. Higher = show first. */
+function scoreInsight(insight, personality) {
+  let p = 0;
+  if (insight.severity === "error")        p += 6;
+  else if (insight.severity === "warning") p += 3;
+  else                                     p += 1;
+  if (insight.type === "security") p += 2;
+  if (insight.type === "git")      p += 1;
+  if (personality?.isAuthSensitive && insight.type === "security") p += 1;
+  if (personality?.isSoloProject && insight.type === "git")        p -= 1;
+  return { ...insight, priority: Math.max(0, Math.min(10, p)) };
+}
+
+/** Group insights by type. Returns [{type, severity(max), count, insights[]}]. */
+function groupInsights(insights) {
+  const groups = {};
+  const order  = { error: 2, warning: 1, info: 0 };
+  for (const i of insights) {
+    if (!groups[i.type]) groups[i.type] = { type: i.type, severity: i.severity, count: 0, insights: [] };
+    groups[i.type].insights.push(i);
+    groups[i.type].count++;
+    if ((order[i.severity] || 0) > (order[groups[i.type].severity] || 0)) {
+      groups[i.type].severity = i.severity;
+    }
+  }
+  return Object.values(groups).sort((a, b) => (order[b.severity] || 0) - (order[a.severity] || 0));
 }
 
 // ── Safety Gates ─────────────────────────────────────────────────────────────
@@ -819,6 +1099,23 @@ const WORKFLOW_RECIPES = {
     parallel: true,
     condition: p => p.personality && p.personality.isSolo,
   },
+  "dependency-audit": {
+    description: "Dependency-focused audit — unused deps, env schema, package health",
+    tasks: ["code", "context"],
+    extras: ["dependency-graph-agent"],
+    parallel: true,
+    condition: p => {
+      if (!p.context?.folder) return false;
+      return fs.existsSync(path.join(p.context.folder, "package.json"));
+    },
+  },
+  "code-quality-focus": {
+    description: "Code quality scan — god files, commit quality, test gaps, bus factor",
+    tasks: ["git", "code", "context", "type-specific"],
+    extras: ["git-quality", "code-smell"],
+    parallel: true,
+    condition: p => p.personality && !p.personality.isMaintenanceMode,
+  },
   "standard": {
     description: "Balanced scan — git, code, security, context",
     tasks: ["git", "code", "security", "context", "type-specific"],
@@ -832,7 +1129,7 @@ class JarvisWorkflow {
   /** Return the first matching recipe for the given project state. */
   selectRecipe(personality, context) {
     const ctx = { personality, context };
-    const priority = ["security-deep", "maintenance-minimal", "performance-focus", "team-full", "solo-quick", "standard"];
+    const priority = ["security-deep", "maintenance-minimal", "performance-focus", "team-full", "solo-quick", "dependency-audit", "code-quality-focus", "standard"];
     for (const name of priority) {
       const r = WORKFLOW_RECIPES[name];
       if (r.condition(ctx)) return { name, ...r };
@@ -970,6 +1267,18 @@ const AGENT_SPECS = {
     file: "performance-audit.md",
     triggers: ["isReact", "isNextJs"],
   },
+  "git-quality": {
+    name: "Jarvis Git Quality Agent",
+    description: "Commit hygiene review: message quality, velocity trends, bus factor analysis, stale branches",
+    file: "git-quality.md",
+    triggers: ["isGit"],
+  },
+  "code-smell": {
+    name: "Jarvis Code Smell Agent",
+    description: "Source quality review: god files, unused deps, test coverage gaps, env schema drift",
+    file: "code-smell.md",
+    triggers: ["hasSrc"],
+  },
 };
 
 class JarvisAgentManager {
@@ -984,9 +1293,11 @@ class JarvisAgentManager {
     } catch { return; }
 
     const defs = {
-      "security-deep.md":   this._securityDeepMd(),
+      "security-deep.md":    this._securityDeepMd(),
       "dependency-graph.md": this._dependencyGraphMd(),
       "performance-audit.md": this._performanceAuditMd(),
+      "git-quality.md":      this._gitQualityMd(),
+      "code-smell.md":       this._codeSmellMd(),
     };
 
     for (const [filename, content] of Object.entries(defs)) {
@@ -1095,6 +1406,77 @@ Analyze the dependency tree and return actionable package management insights.
 ## Constraints
 - Read-only analysis from package.json and source files only
 - Do not run npm install, npm audit, or any shell commands
+`;
+  }
+
+  _gitQualityMd() {
+    return `# Jarvis Git Quality Agent
+
+You are a specialized git hygiene subagent deployed by Jarvis.
+
+## Mission
+Analyze commit history and return actionable insights on commit quality, velocity, and collaboration health.
+
+## Steps
+
+1. **Commit message quality**: Review the last 30 messages (\`git log --format="%s" -30\`). Flag messages under 10 chars or matching \`/^(wip|fix|temp|tmp|test|asdf|\\.+)$/i\`. Report percentage of low-quality commits.
+
+2. **Velocity trend**: Compare commits/week for the last 4 weeks vs the prior 4 weeks (\`git log --format="%ct" --since="8 weeks ago"\`). A drop >50% is a risk signal.
+
+3. **Bus factor**: Count unique authors in the last 100 commits (\`git log --format="%ae" -100\`). Flag if one author wrote >80%.
+
+4. **Stale branches**: List branches open more than 14 days (\`git branch -r --sort=-committerdate\` + \`git log -1 --format="%cr"\` per branch).
+
+## Output Format
+
+\`\`\`json
+{
+  "commitQuality": { "lowQualityPct": 0, "examples": [] },
+  "velocity": { "recentRate": 0, "priorRate": 0, "trend": "stable|up|down" },
+  "busFactor": { "topAuthorPct": 0, "risk": false },
+  "staleBranches": [],
+  "summary": "one-sentence summary"
+}
+\`\`\`
+
+## Constraints
+- Read-only: git log, git branch, git shortlog only
+- Do not run git fetch, push, or any write operations
+`;
+  }
+
+  _codeSmellMd() {
+    return `# Jarvis Code Smell Agent
+
+You are a specialized code quality subagent deployed by Jarvis.
+
+## Mission
+Identify structural code quality issues and return prioritized recommendations.
+
+## Steps
+
+1. **God files**: Scan src/ (max 2 levels deep) for files over 500 lines. List by line count descending.
+
+2. **Unused dependencies**: Read package.json \`dependencies\`, then scan src/ for \`require()\`/\`from\` patterns. Flag deps that never appear in imports. Skip CLI-only tools: husky, dotenv-cli, rimraf, cross-env, concurrently, nodemon.
+
+3. **Test gaps**: From \`git diff --name-only HEAD~3..HEAD\`, filter src/ source files. Check for a matching \`.test.{ext}\` or \`.spec.{ext}\` counterpart. List source files missing tests.
+
+4. **Env schema drift**: Parse \`.env.example\` and \`.env\`. List keys in \`.env.example\` not set in \`.env\`.
+
+## Output Format
+
+\`\`\`json
+{
+  "godFiles": [{ "file": "src/...", "lines": 0 }],
+  "unusedDeps": [],
+  "testGaps": [],
+  "envMissingKeys": [],
+  "summary": "one-sentence summary"
+}
+\`\`\`
+
+## Constraints
+- Read-only: file reads and git diff only — no shell commands, no installs, no writes
 `;
   }
 
@@ -1405,10 +1787,14 @@ class Jarvis {
       const sessionResults = [];
       for (const p of projects) {
         try {
-          const [gitInsights, codeInsights, personality] = await Promise.all([
+          const [gitInsights, codeInsights, personality, velocityResult, commitQualityInsights, testGapInsights, busFactorInsights] = await Promise.all([
             withTimeout(analyzeGitStatus(p), this.scanTimeout).catch(() => []),
             analyzeCodeHealth(p),
             detectProjectPersonality(p).catch(() => ({})),
+            analyzeGitVelocity(p).catch(() => ({ insights: [], weeklyRate: null, trend: null })),
+            analyzeCommitQuality(p).catch(() => []),
+            analyzeTestGap(p).catch(() => []),
+            analyzeBusFactor(p).catch(() => []),
           ]);
           const securityInsights = analyzeSecurityQuick(p);
           const recap = analyzeSessionRecap(p);
@@ -1429,14 +1815,26 @@ class Jarvis {
             ...analyzeNextJsHealth(p, projectContext),
           ];
 
+          // Sync analyzers — run after context is known
+          const godFileInsights    = analyzeGodFiles(p);
+          const unusedDepInsights  = analyzeUnusedDeps(p);
+          const envSchemaInsights  = analyzeEnvSchema(p);
+
           const rawInsights = [
             ...gitInsights.filter(i => i.id),
             ...recap.insights, ...codeInsights, ...securityInsights, ...contextInsights, ...typeInsights,
+            ...velocityResult.insights, ...commitQualityInsights, ...testGapInsights, ...busFactorInsights,
+            ...godFileInsights, ...unusedDepInsights, ...envSchemaInsights,
           ];
 
-          // Adapt insights based on project context and personality before filtering
+          // Adapt → filter → priority-score → sort
           const allInsights = adaptInsightsForContext(rawInsights, projectContext, personality)
-            .filter(i => !this._dismissed.has(i.id) && !shouldSuppress(i.id, this._memory));
+            .filter(i => !this._dismissed.has(i.id) && !shouldSuppress(i.id, this._memory))
+            .map(i => scoreInsight(i, personality))
+            .sort((a, b) => b.priority - a.priority);
+
+          const healthScore   = computeHealthScore(allInsights, projectContext, personality);
+          const insightGroups = groupInsights(allInsights);
 
           const branch = gitInsights.branch || null;
           const uncommittedCount = gitInsights.filter(i => i.action === "commit").reduce((n, i) => {
@@ -1454,8 +1852,9 @@ class Jarvis {
             lastActivityAt: recap.lastActivityAt,
             lastUserMessage: recap.lastUserMessage,
             lastAssistantMessage: recap.lastAssistantMessage,
-            git: { branch, uncommittedCount, unpushedCount },
+            git: { branch, uncommittedCount, unpushedCount, weeklyRate: velocityResult.weeklyRate, velocityTrend: velocityResult.trend },
             insights: allInsights, context: projectContext, personality,
+            healthScore, insightGroups,
             workflow: recipe.name,
             recommendedAgents: this._agentMgr.selectAgentsForProject(personality, projectContext).map(a => a.id),
           });

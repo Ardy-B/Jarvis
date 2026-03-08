@@ -28,6 +28,45 @@ jarvis-mcp.mjs → Optional MCP server: exposes briefing, learnings, trends as C
 - **Agent Manager**: `JarvisAgentManager` — maintains .claude/agents/ definitions; auto-writes on startup; recommends agents per project
 - **Self-Improvement Engine**: `JarvisSelfImprover` — runs after every briefing; auto-suppresses noise, rewrites CLAUDE.md rules, generates project rule files, calibrates workflows; logs all changes to .jarvis/improvements.json
 
+### Analyzers (per-project, all run in parallel via Promise.all)
+| Analyzer | Type | What it checks |
+|----------|------|----------------|
+| analyzeGitStatus | async | uncommitted, unpushed, conflicts, stash, .env tracked, stale branch |
+| analyzeCodeHealth | async | missing node_modules, smart TODOs (recent files only) |
+| analyzeSecurityQuick | sync | .gitignore check, secret pattern scan (API keys, JWT, DB URLs) |
+| analyzeProjectContext | sync | CLAUDE.md, Plan.md, tech stack, domain rules, README |
+| analyzeTypeScriptHealth | sync | tsconfig presence, strict mode |
+| analyzePythonHealth | sync | .venv, requirements.txt/pyproject.toml |
+| analyzeNextJsHealth | sync | mixed router, missing next.config |
+| analyzeGitVelocity | async | commits/week last 4wk vs prior 4wk — surfaces velocity drops |
+| analyzeCommitQuality | async | flags low-quality messages (wip, <10 chars, throwaway patterns) |
+| analyzeGodFiles | sync | src/ files >500 lines — top offender surfaced as warning |
+| analyzeTestGap | async | recently changed src/ files with no .test/.spec counterpart |
+| analyzeUnusedDeps | sync | package.json deps never imported in src/ source files |
+| analyzeEnvSchema | sync | .env.example keys missing from .env |
+| analyzeBusFactor | async | flags single-author concentration >80% of last 100 commits |
+
+### Session Result Shape (each entry in `briefing.sessions[]`)
+```
+{
+  id, name, status,
+  lastActivityAt, lastUserMessage, lastAssistantMessage,
+  git: { branch, uncommittedCount, unpushedCount, weeklyRate, velocityTrend },
+  insights: Insight[],        // priority-scored (0-10), sorted highest first
+  insightGroups: Group[],     // [{type, severity(max), count, insights[]}]
+  healthScore: number,        // 0-100 composite score
+  context: ProjectContext,    // techStack, framework, hasTests, hasClaude, folder, domainRules
+  personality: Personality,   // isSoloProject, isMaintenanceMode, isAuthSensitive, daysSinceCommit
+  workflow: string,           // recipe name selected for this session
+  recommendedAgents: string[] // agent IDs relevant to this project
+}
+```
+
+### Insight Shape
+```
+{ id, type, severity: "error"|"warning"|"info", title, detail, action?, priority: 0-10 }
+```
+
 ## Integration Pattern
 ```js
 const { Jarvis } = require("../Jarvis/jarvis");
@@ -66,6 +105,33 @@ jarvis.setProjects([...]); // host provides project data
 - `POST /improve`           → force-run the self-improvement cycle now; returns list of changes
 - `GET  /improve/log`       → view full improvement history (every autonomous change with reason)
 
+## Workflow Recipes (8 total — evaluated in priority order)
+| Recipe | Triggers on | Spawns agents |
+|--------|------------|---------------|
+| security-deep | isAuthSensitive | security-deep |
+| maintenance-minimal | isMaintenanceMode | — |
+| performance-focus | React or Next.js stack | performance-audit |
+| team-full | multi-author project | dependency-graph |
+| solo-quick | solo developer | — |
+| dependency-audit | has package.json | dependency-graph |
+| code-quality-focus | active (non-maintenance) project | git-quality, code-smell |
+| standard | fallback | — |
+
+## Specialized Agents (5 total — auto-written to .claude/agents/ on startup)
+| Agent file | Purpose |
+|-----------|---------|
+| security-deep.md | Auth flow, secrets, CORS, env config deep audit |
+| dependency-graph.md | Package tree, wrong categories, duplicate capabilities |
+| performance-audit.md | Bundle size, React rendering, Next.js patterns |
+| git-quality.md | Commit hygiene, velocity trend, bus factor, stale branches |
+| code-smell.md | God files, unused deps, test gaps, env schema drift |
+
+## Slash Commands (.claude/commands/)
+- `/test-integration` — verify Jarvis loads and instantiates correctly
+- `/review` — pre-commit checklist (no new requires, no execSync, try/catch, route check)
+- `/jarvis-health` — display health scores, velocity, and insight counts per project
+- `/jarvis-agents` — list available agents and spawn recommended ones for a session
+
 ## Gotchas
 - Frontend uses host CSS variables (--glass, --txt, --red, etc.) — undefined vars = broken UI
 - jarvis-ui.jsx loads via synchronous XHR + Babel.transform, not a module bundler
@@ -78,10 +144,16 @@ jarvis.setProjects([...]); // host provides project data
 - Improvement log auto-caps at 200 entries (.jarvis/improvements.json)
 - Project rule files (.claude/rules/jarvis-*.md) are written in the HOST project's folder, not Jarvis's folder
 - MCP tools `run_self_improvement` and `get_improvement_log` give AI sessions full self-improvement access
+- analyzeUnusedDeps skips CLI-only packages (husky, dotenv-cli, rimraf, cross-env, nodemon, etc.)
+- healthScore: starts at 100, -20/error, -10/warning, -2/info, +5 hasClaude, +5 hasTests, floor 0
+- insights are priority-scored 0-10 and sorted highest-first before being returned
+- insightGroups is a digest view — [{type, severity(max), count, insights[]}] — useful for compact UI
+- velocityTrend: "up"|"down"|"stable"|null — only "down" with prior≥4 commits generates a warning insight
+- analyzeBusFactor requires ≥10 commits in history; flags >80% single-author concentration
 
 ## Learned Rules
 _Auto-generated by Jarvis reflection engine · 2026-03-08_
 
 _No high-confidence rules yet. Keep using Jarvis to build up patterns._
 
-_Memory: 1 dismissals · 0 actions · 12 snapshots_
+_Memory: 1 dismissals · 0 actions · 31 snapshots_
