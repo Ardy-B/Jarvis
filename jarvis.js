@@ -797,6 +797,134 @@ function groupInsights(insights) {
   return Object.values(groups).sort((a, b) => (order[b.severity] || 0) - (order[a.severity] || 0));
 }
 
+// ── Insight Enrichment (Deep Dive) ───────────────────────────────────────────
+
+/** Enrich insights with impact descriptions and actionable steps for Deep Dive mode */
+function enrichInsight(insight) {
+  const id = insight.id || "";
+  const type = insight.type;
+  const sev = insight.severity;
+
+  // Pattern-based enrichment — match insight ID prefixes
+  if (id.startsWith("git-conflicts-")) {
+    return { ...insight,
+      impact: "Merge conflicts block all git operations. You cannot commit, push, or merge until these are resolved.",
+      steps: ["Open each conflicted file and resolve the conflict markers (<<<, ===, >>>)", "Stage the resolved files with git add", "Commit the merge resolution"],
+      category: "blockers" };
+  }
+  if (id.startsWith("git-uncommitted-")) {
+    const count = parseInt((insight.title.match(/^(\d+)/) || [])[1]) || 0;
+    return { ...insight,
+      impact: count > 10 ? "Large uncommitted changesets are risky — a crash or accidental reset could lose significant work." : "Uncommitted changes aren't backed up. Regular commits create safe checkpoints.",
+      steps: ["Review changes with git diff", "Stage related files: git add <files>", "Commit with a descriptive message", "Consider splitting into multiple focused commits if changes span different features"],
+      category: "git-hygiene" };
+  }
+  if (id.startsWith("git-unpushed-")) {
+    return { ...insight,
+      impact: "Unpushed commits exist only on your machine. If your drive fails or you switch machines, this work is lost.",
+      steps: ["Review what you're pushing: git log @{u}..HEAD", "Push to remote: git push", "If on a feature branch, consider opening a PR"],
+      category: "git-hygiene" };
+  }
+  if (id.startsWith("git-on-main-")) {
+    return { ...insight,
+      impact: "Working directly on main makes it harder to revert changes, creates messy history, and risks breaking the default branch for collaborators.",
+      steps: ["Create a feature branch: git checkout -b feature/<name>", "Your existing uncommitted changes will come with you", "When done, merge via PR or git merge"],
+      category: "git-hygiene" };
+  }
+  if (id.startsWith("git-stale-branch-")) {
+    return { ...insight,
+      impact: "Long-lived branches diverge from main over time, making merges harder and increasing conflict risk.",
+      steps: ["If the work is done, merge or open a PR", "If it's stale, consider deleting the branch", "If work is ongoing, rebase onto main to stay current: git rebase main"],
+      category: "git-hygiene" };
+  }
+  if (id.startsWith("git-stash-")) {
+    return { ...insight,
+      impact: "Stashed changes are easy to forget. They may contain work you intended to come back to.",
+      steps: ["List stashes: git stash list", "Preview a stash: git stash show -p stash@{0}", "Apply if needed: git stash pop", "Drop if obsolete: git stash drop stash@{0}"],
+      category: "cleanup" };
+  }
+  if (id.startsWith("git-env-tracked-") || id.startsWith("env-gitignore-") || id.startsWith("no-gitignore-")) {
+    return { ...insight,
+      impact: "Secrets committed to git persist in history forever, even after deletion. Anyone with repo access can extract them.",
+      steps: ["Add .env to .gitignore immediately", "Remove from tracking: git rm --cached .env", "Rotate any exposed secrets (API keys, passwords)", "Consider using git-filter-repo to purge from history if already pushed"],
+      category: "blockers" };
+  }
+  if (id.startsWith("secret-")) {
+    return { ...insight,
+      impact: "Hardcoded secrets in source code can be extracted by anyone with repo access and are difficult to rotate.",
+      steps: ["Move the secret to an environment variable", "Reference via process.env.SECRET_NAME", "Add the .env file to .gitignore", "If already committed, rotate the credential immediately"],
+      category: "blockers" };
+  }
+  if (id.startsWith("no-modules-")) {
+    return { ...insight,
+      impact: "The project has a package.json but no node_modules. Nothing will run until dependencies are installed.",
+      steps: ["Run npm install (or yarn/pnpm install)", "Check for any installation errors", "Verify the project runs after installation"],
+      category: "blockers" };
+  }
+  if (id.startsWith("todos-")) {
+    return { ...insight,
+      impact: "TODOs in recently changed files indicate incomplete work that should be addressed before shipping.",
+      steps: ["Review each TODO to assess urgency", "Complete or create issues for each one", "Remove the TODO comment once addressed"],
+      category: "code-quality" };
+  }
+  if (id.startsWith("no-claude-")) {
+    return { ...insight,
+      impact: "Without a CLAUDE.md, Claude Code has no project context and will make assumptions that may not match your architecture.",
+      steps: ["Create a CLAUDE.md in the project root", "Document: tech stack, architecture, conventions, hard constraints", "Keep it concise (100-200 lines) — quality over quantity"],
+      category: "developer-experience" };
+  }
+  if (id.startsWith("stale-")) {
+    return { ...insight,
+      impact: "This session has been inactive. The context may be stale — Claude's understanding of the codebase may be outdated.",
+      steps: ["Review where you left off", "Consider starting a fresh session if significant changes were made outside this session", "Re-read CLAUDE.md to re-anchor context"],
+      category: "cleanup" };
+  }
+  if (id.startsWith("commit-quality-")) {
+    return { ...insight,
+      impact: "Low-quality commit messages make it impossible to understand project history, debug regressions, or review changes.",
+      steps: ["Use descriptive commit messages: what changed and why", "Follow conventional commits format: feat:, fix:, refactor:", "Avoid generic messages like 'wip', 'fix', 'update'"],
+      category: "code-quality" };
+  }
+  if (id.startsWith("test-gap-")) {
+    return { ...insight,
+      impact: "Recently changed files without tests are more likely to ship bugs. Test coverage gaps compound over time.",
+      steps: ["Write tests for the most critical changed files first", "Focus on edge cases and error paths", "Consider adding a pre-commit hook to enforce test coverage"],
+      category: "code-quality" };
+  }
+  if (id.startsWith("god-file-")) {
+    return { ...insight,
+      impact: "Files over 500 lines are harder to navigate, test, and maintain. They often indicate mixed responsibilities.",
+      steps: ["Identify distinct responsibilities within the file", "Extract related functions into focused modules", "Keep the original file as a thin orchestrator if needed"],
+      category: "code-quality" };
+  }
+  if (id.startsWith("unused-dep-")) {
+    return { ...insight,
+      impact: "Unused dependencies increase install time, bundle size, and potential security attack surface.",
+      steps: ["Verify the dependency isn't used indirectly (CLI tools, plugins)", "Remove with: npm uninstall <package>", "Run tests to confirm nothing breaks"],
+      category: "cleanup" };
+  }
+  if (id.startsWith("bus-factor-")) {
+    return { ...insight,
+      impact: "Single-contributor projects have no knowledge redundancy. If the contributor is unavailable, progress stops.",
+      steps: ["Document key architecture decisions", "Write CLAUDE.md so AI assistants can help maintain the project", "Consider code reviews even for solo work (use Claude for review)"],
+      category: "developer-experience" };
+  }
+  if (id.startsWith("velocity-")) {
+    const isDown = insight.title?.toLowerCase().includes("down") || insight.title?.toLowerCase().includes("slow");
+    return { ...insight,
+      impact: isDown ? "Commit velocity is declining. This may indicate blockers, scope creep, or burnout." : "Commit velocity is healthy and trending upward.",
+      steps: isDown ? ["Review recent work for blockers or stalled PRs", "Break large tasks into smaller, committable chunks", "Consider pairing or asking for help on stuck items"] : ["Keep up the momentum", "Ensure commits are focused and well-scoped"],
+      category: "trends" };
+  }
+
+  // Fallback enrichment based on type/severity
+  const categoryMap = { security: "blockers", git: "git-hygiene", health: "code-quality", activity: "cleanup" };
+  return { ...insight,
+    impact: sev === "error" ? "This requires immediate attention." : sev === "warning" ? "This should be addressed soon to prevent issues." : "This is informational — address when convenient.",
+    steps: insight.action ? [`Use the ${insight.action} action to address this`] : ["Review and address manually"],
+    category: categoryMap[type] || "general" };
+}
+
 // ── Safety Gates ─────────────────────────────────────────────────────────────
 
 async function assessActionRisk(project, action) {
@@ -836,7 +964,20 @@ class JarvisMemory {
     this._maxSnapshots = 50;
     this._maxDismissals = 200;
     this._maxActions = 200;
+    this._dirty = false;
+    this._saveTimer = null;
+    this._saveDebounceMs = 5000; // flush at most every 5s
+    this._lastDismissalCount = 0;  // watermarks for change detection
+    this._lastActionCount = 0;
+    this._rulesHash = "";
     this._load();
+    this._updateWatermarks();
+
+    // Flush on process exit so no data is lost
+    const flushOnExit = () => this.flush();
+    process.on("exit", flushOnExit);
+    process.on("SIGINT", () => { flushOnExit(); process.exit(0); });
+    process.on("SIGTERM", () => { flushOnExit(); process.exit(0); });
   }
 
   _load() {
@@ -849,12 +990,51 @@ class JarvisMemory {
     } catch {}
   }
 
+  // Debounced save — marks dirty, flushes after delay
   _save() {
+    this._dirty = true;
+    if (this._saveTimer) return; // already scheduled
+    this._saveTimer = setTimeout(() => {
+      this.flush();
+      this._saveTimer = null;
+    }, this._saveDebounceMs);
+  }
+
+  // Immediate write to disk — called by debounce timer and on shutdown
+  flush() {
+    if (!this._dirty) return;
     try {
       const dir = path.dirname(this._path);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(this._path, JSON.stringify(this._data, null, 2));
+      this._dirty = false;
     } catch {}
+  }
+
+  _updateWatermarks() {
+    this._lastDismissalCount = this._data.dismissals.length;
+    this._lastActionCount = this._data.actions.length;
+    this._rulesHash = this._computeRulesHash();
+  }
+
+  _computeRulesHash() {
+    return this._data.rules.map(r => r.id).sort().join(",");
+  }
+
+  // Check if new dismissals/actions have been recorded since last reflection
+  hasNewData() {
+    return this._data.dismissals.length > this._lastDismissalCount
+        || this._data.actions.length > this._lastActionCount;
+  }
+
+  // Check if rules have changed since last check
+  haveRulesChanged() {
+    return this._computeRulesHash() !== this._rulesHash;
+  }
+
+  // Mark watermarks as current (called after reflection/improvement runs)
+  markReflected() {
+    this._updateWatermarks();
   }
 
   // Record a briefing snapshot (compact form — just insight IDs, severities, counts)
@@ -1662,10 +1842,13 @@ class JarvisSelfImprover {
   /**
    * Live-rewrite the ## Learned Rules section of CLAUDE.md.
    * This runs automatically on every improvement cycle, replacing the need for cron/scripts.
+   * Skips if rules haven't changed since last write.
    */
   _rewriteLearnedRules(memory, snapshotCount) {
     const claudeMdPath = path.join(this._rootDir, "CLAUDE.md");
     if (!fs.existsSync(claudeMdPath)) return null;
+    // Skip if rules haven't changed since last reflection
+    if (!memory.haveRulesChanged()) return null;
     try {
       const rules      = memory.getRules().filter(r => (r.confidence || 0) >= 0.6);
       const dismissals = memory.getDismissals();
@@ -1753,6 +1936,7 @@ class Jarvis {
     this.scanTimeout = opts.scanTimeout || 10000;
     this._projects = [];
     this._cache = { briefing: null, generatedAt: 0, scanning: false };
+    this._cacheInvalidated = true; // force first briefing
     this._dismissed = new Set();
 
     // Memory — stored alongside jarvis.js by default, or configurable
@@ -1771,11 +1955,15 @@ class Jarvis {
   }
 
   setProjects(projects) { this._projects = projects || []; }
-  invalidateCache() { this._cache.generatedAt = 0; }
+  invalidateCache() { this._cache.generatedAt = 0; this._cacheInvalidated = true; }
   getCachedBriefing() { return this._cache.briefing; }
 
   async getBriefing(force = false) {
     if (!force && this._cache.briefing && (Date.now() - this._cache.generatedAt < this.cacheTTL)) {
+      return this._cache.briefing;
+    }
+    // Skip periodic re-scans if nothing was invalidated and we have a cached briefing
+    if (!force && !this._cacheInvalidated && this._cache.briefing) {
       return this._cache.briefing;
     }
     if (this._cache.scanning) return this._cache.briefing;
@@ -1827,10 +2015,11 @@ class Jarvis {
             ...godFileInsights, ...unusedDepInsights, ...envSchemaInsights,
           ];
 
-          // Adapt → filter → priority-score → sort
+          // Adapt → filter → priority-score → enrich → sort
           const allInsights = adaptInsightsForContext(rawInsights, projectContext, personality)
             .filter(i => !this._dismissed.has(i.id) && !shouldSuppress(i.id, this._memory))
             .map(i => scoreInsight(i, personality))
+            .map(i => enrichInsight(i))
             .sort((a, b) => b.priority - a.priority);
 
           const healthScore   = computeHealthScore(allInsights, projectContext, personality);
@@ -1953,17 +2142,27 @@ class Jarvis {
       // Trend detection — compare against historical snapshots
       try { briefing.trends = detectTrends(briefing, this._memory); } catch {}
 
-      // Reflection — extract patterns from memory
-      try { briefing.learnings = reflect(this._memory); } catch {}
+      // Reflection — extract patterns from memory (skip if no new dismissals/actions)
+      try {
+        if (this._memory.hasNewData()) {
+          briefing.learnings = reflect(this._memory);
+        }
+      } catch {}
 
       // Record snapshot for future trend analysis
       try { this._memory.recordSnapshot(briefing); } catch {}
 
       // Self-improvement cycle — analyze usage, rewrite rules, tune config
       // Runs asynchronously so it never blocks the briefing response
-      this._improver.runCycle(briefing, this._hookMgr, this._agentMgr).catch(() => {});
+      // Only runs if there's new data to learn from
+      if (this._memory.hasNewData()) {
+        this._improver.runCycle(briefing, this._hookMgr, this._agentMgr)
+          .then(() => this._memory.markReflected())
+          .catch(() => {});
+      }
 
       this._cache = { briefing, generatedAt: Date.now(), scanning: false };
+      this._cacheInvalidated = false;
       return briefing;
     } catch (err) {
       this._cache.scanning = false;
