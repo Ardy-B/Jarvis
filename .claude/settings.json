@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo '\\n📋  Session ending — update Plan.md if work is in progress' >&2"
+            "command": "node scripts/reflect.js 2>&1 >&2; echo '📋  Session ending — update Plan.md if work is in progress' >&2"
           }
         ]
       }
