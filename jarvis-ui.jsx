@@ -689,6 +689,43 @@
     );
   }
 
+  // ── usePanelLayout — space-aware panel positioning ──────────────────
+  function usePanelLayout(position, isExpanded, isDesktop) {
+    const [vp, setVp] = useState({ w: typeof window !== "undefined" ? window.innerWidth : 1200, h: typeof window !== "undefined" ? window.innerHeight : 800 });
+    useEffect(() => {
+      if (!isExpanded || !isDesktop) return;
+      const onResize = () => setVp({ w: window.innerWidth, h: window.innerHeight });
+      window.addEventListener("resize", onResize);
+      return () => window.removeEventListener("resize", onResize);
+    }, [isExpanded, isDesktop]);
+
+    return useMemo(() => {
+      if (!isDesktop) {
+        return { direction: "up", panelStyle: {
+          position: "fixed", bottom: 0, right: 0, left: 0, top: "auto",
+          width: "100%", maxHeight: "85dvh", borderRadius: "18px 18px 0 0",
+          zIndex: 9992, transformOrigin: "bottom center",
+        }};
+      }
+      const ORB = 56, GAP = 14, PW = 380, MIN_H = 200, MAX_H = 580, EDGE = 12;
+      const spaceAbove = vp.h - position.bottom - ORB - GAP;
+      const spaceBelow = position.bottom - GAP;
+      const dir = spaceAbove >= spaceBelow ? "up" : "down";
+      const maxH = Math.max(MIN_H, Math.min(MAX_H, (dir === "up" ? spaceAbove : spaceBelow) - EDGE));
+      const overflow = (position.right + PW + 8) - vp.w;
+      const rOff = overflow > 0 ? -overflow : -8;
+      const clampedR = Math.max(-(position.right - EDGE), Math.min(rOff, 0));
+      return { direction: dir, panelStyle: {
+        position: "absolute",
+        bottom: dir === "up" ? (ORB + GAP) : "auto",
+        top: dir === "down" ? (ORB + GAP) : "auto",
+        right: clampedR, left: "auto", width: PW, maxHeight: maxH,
+        borderRadius: 18, zIndex: "auto",
+        transformOrigin: dir === "up" ? "bottom right" : "top right",
+      }};
+    }, [isDesktop, position.bottom, position.right, vp.w, vp.h]);
+  }
+
   // ── FloatingBubble — orb + expanded panel ─────────────────────────────
 
   function FloatingBubble({ briefing, isExpanded, onToggle, onResume, onDismissInsight, onAction, onRefresh, isDesktop,
@@ -768,6 +805,8 @@
       return { criticalInsights: critical, otherInsights: other };
     }, [briefing]);
 
+    const { panelStyle, direction } = usePanelLayout(position, isExpanded, isDesktop);
+
     return (
       <div style={{ position:"fixed", bottom: position.bottom, right: position.right, zIndex:9990, pointerEvents:"auto" }}>
 
@@ -782,18 +821,11 @@
         {/* ── Expanded Panel ── */}
         {isExpanded && briefing && (
           <div style={{
-            position: isDesktop ? "absolute" : "fixed",
-            bottom: isDesktop ? 70 : 0,
-            right: isDesktop ? -8 : 0,
-            left: isDesktop ? "auto" : 0,
-            width: isDesktop ? 380 : "100%",
-            maxHeight: isDesktop ? "min(580px, calc(100vh - 120px))" : "85dvh",
-            borderRadius: isDesktop ? 18 : "18px 18px 0 0",
-            zIndex: isDesktop ? "auto" : 9992,
+            ...panelStyle,
             background: "var(--glass)", backdropFilter: "blur(28px)", WebkitBackdropFilter: "blur(28px)",
             border: "1px solid var(--glass-border)",
             boxShadow: "var(--glass-shd2), var(--glass-glow)",
-            animation: "jarvisPanelIn .35s cubic-bezier(.34,1.56,.64,1) forwards",
+            animation: (direction === "down" ? "jarvisPanelInDown" : "jarvisPanelIn") + " .35s cubic-bezier(.34,1.56,.64,1) forwards",
             overflowY: "auto", overflowX: "hidden", scrollbarWidth: "thin",
             WebkitOverflowScrolling: "touch",
           }}>
@@ -840,31 +872,38 @@
                   title={powersOpen ? "Back to briefing" : "Powers"}
                   style={{ background: powersOpen ? "var(--accBg)" : "transparent",
                     border: powersOpen ? "1px solid var(--acc)" : "none",
-                    color: powersOpen ? "var(--acc)" : "var(--txt4)", cursor:"pointer", padding:4, fontSize:13,
+                    color: powersOpen ? "var(--acc)" : "var(--txt4)", cursor:"pointer",
+                    padding: isDesktop ? 4 : 8, fontSize: isDesktop ? 13 : 16, minHeight: isDesktop ? "auto" : 36, minWidth: isDesktop ? "auto" : 36,
+                    display:"flex", alignItems:"center", justifyContent:"center",
                     transition:"all .15s", borderRadius:6 }}
-                  onMouseEnter={e => { if (!powersOpen) e.currentTarget.style.color = "var(--acc)"; }}
-                  onMouseLeave={e => { if (!powersOpen) e.currentTarget.style.color = "var(--txt4)"; }}>\u26A1</button>
+                  onMouseEnter={isDesktop ? (e => { if (!powersOpen) e.currentTarget.style.color = "var(--acc)"; }) : undefined}
+                  onMouseLeave={isDesktop ? (e => { if (!powersOpen) e.currentTarget.style.color = "var(--txt4)"; }) : undefined}>\u26A1</button>
                 {!powersOpen && onToggleDeepDive && (
                   <button onClick={(e) => { e.stopPropagation(); onToggleDeepDive(); }} title="Deep Dive — Full Screen Analysis"
-                    style={{ background:"transparent", border:"1px solid var(--glass-border)", color:"var(--txt4)", cursor:"pointer", padding:"2px 8px", fontSize:10,
-                      fontWeight:600, transition:"all .15s", borderRadius:6, display:"flex", alignItems:"center", gap:3 }}
-                    onMouseEnter={e => { e.currentTarget.style.color = "var(--acc)"; e.currentTarget.style.borderColor = "var(--acc)"; }}
-                    onMouseLeave={e => { e.currentTarget.style.color = "var(--txt4)"; e.currentTarget.style.borderColor = "var(--glass-border)"; }}>
+                    style={{ background:"transparent", border:"1px solid var(--glass-border)", color:"var(--txt4)", cursor:"pointer",
+                      padding: isDesktop ? "2px 8px" : "8px 14px", fontSize: isDesktop ? 10 : 12, minHeight: isDesktop ? "auto" : 36,
+                      fontWeight:600, transition:"all .15s", borderRadius: isDesktop ? 6 : 8, display:"flex", alignItems:"center", gap: isDesktop ? 3 : 5 }}
+                    onMouseEnter={isDesktop ? (e => { e.currentTarget.style.color = "var(--acc)"; e.currentTarget.style.borderColor = "var(--acc)"; }) : undefined}
+                    onMouseLeave={isDesktop ? (e => { e.currentTarget.style.color = "var(--txt4)"; e.currentTarget.style.borderColor = "var(--glass-border)"; }) : undefined}>
                     {"\u26A1"} Deep Dive
                   </button>
                 )}
                 {!powersOpen && (
                   <button onClick={(e) => { e.stopPropagation(); onRefresh(); }} title="Refresh"
-                    style={{ background:"transparent", border:"none", color:"var(--txt4)", cursor:"pointer", padding:4, fontSize:14,
+                    style={{ background:"transparent", border:"none", color:"var(--txt4)", cursor:"pointer",
+                      padding: isDesktop ? 4 : 8, fontSize: isDesktop ? 14 : 16, minHeight: isDesktop ? "auto" : 36, minWidth: isDesktop ? "auto" : 36,
+                      display:"flex", alignItems:"center", justifyContent:"center",
                       transition:"color .15s", borderRadius:6 }}
-                    onMouseEnter={e => e.currentTarget.style.color = "var(--txt)"}
-                    onMouseLeave={e => e.currentTarget.style.color = "var(--txt4)"}>{"\u21BB"}</button>
+                    onMouseEnter={isDesktop ? (e => e.currentTarget.style.color = "var(--txt)") : undefined}
+                    onMouseLeave={isDesktop ? (e => e.currentTarget.style.color = "var(--txt4)") : undefined}>{"\u21BB"}</button>
                 )}
                 <button onClick={(e) => { e.stopPropagation(); onToggle(); }} title="Close"
-                  style={{ background:"transparent", border:"none", color:"var(--txt4)", cursor:"pointer", padding:4, fontSize:14,
+                  style={{ background:"transparent", border:"none", color:"var(--txt4)", cursor:"pointer",
+                    padding: isDesktop ? 4 : 8, fontSize: isDesktop ? 14 : 16, minHeight: isDesktop ? "auto" : 36, minWidth: isDesktop ? "auto" : 36,
+                    display:"flex", alignItems:"center", justifyContent:"center",
                     transition:"color .15s", borderRadius:6 }}
-                  onMouseEnter={e => e.currentTarget.style.color = "var(--txt)"}
-                  onMouseLeave={e => e.currentTarget.style.color = "var(--txt4)"}>{"\u2715"}</button>
+                  onMouseEnter={isDesktop ? (e => e.currentTarget.style.color = "var(--txt)") : undefined}
+                  onMouseLeave={isDesktop ? (e => e.currentTarget.style.color = "var(--txt4)") : undefined}>{"\u2715"}</button>
               </div>
             </div>
 
@@ -1047,7 +1086,7 @@
     });
     const [powersOpen, setPowersOpen] = useState(false);
     const [deepDiveOpen, setDeepDiveOpen] = useState(false);
-    const mobileAutoOpenedRef = useRef(false);
+
     const [powers, setPowers] = useState({ workflows: [], agents: [], hooks: {}, learnings: [], improveLog: [], learningStats: null });
 
     const headers = useCallback(() => authHeaders(getAuthToken), [getAuthToken]);
@@ -1062,14 +1101,7 @@
 
     useEffect(() => { fetchBriefing(); }, [fetchBriefing]);
 
-    // Auto-open Deep Dive on mobile when briefing first arrives with sessions
-    useEffect(() => {
-      if (!isDesktop && briefing && briefing.sessions?.length > 0 && !mobileAutoOpenedRef.current) {
-        mobileAutoOpenedRef.current = true;
-        setDeepDiveOpen(true);
-        setIsMinimized(true);
-      }
-    }, [isDesktop, briefing]);
+    // Note: Deep Dive no longer auto-opens on mobile — user must tap to open it
 
     // Fetch powers data when powers panel opens
     const fetchPowers = useCallback(() => {
@@ -1252,11 +1284,11 @@
               <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
                 <span style={{ fontSize: 10, color: "var(--amb)", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{"\u26A0"}</span>
                 <button onClick={(e) => { e.stopPropagation(); handleAction(true); }} disabled={loading}
-                  style={{ background: "var(--amb)", border: "none", color: "var(--bg)", cursor: "pointer", padding: "2px 8px", fontSize: 10, fontWeight: 600, borderRadius: 4 }}>
+                  style={{ background: "var(--amb)", border: "none", color: "var(--bg)", cursor: "pointer", padding: "5px 10px", fontSize: 11, fontWeight: 600, borderRadius: 6, minHeight: 30 }}>
                   {loading ? "..." : "Confirm"}
                 </button>
                 <button onClick={(e) => { e.stopPropagation(); setPendingConfirm(null); }}
-                  style={{ background: "var(--glass2)", border: "1px solid var(--glass-border)", color: "var(--txt4)", cursor: "pointer", padding: "2px 6px", fontSize: 10, borderRadius: 4 }}>
+                  style={{ background: "var(--glass2)", border: "1px solid var(--glass-border)", color: "var(--txt4)", cursor: "pointer", padding: "5px 8px", fontSize: 11, borderRadius: 6, minHeight: 30 }}>
                   {"\u2715"}
                 </button>
               </span>
@@ -1264,8 +1296,8 @@
             {insight.action && onAction && !expanded && !actionResult && !pendingConfirm && (
               <button onClick={(e) => { e.stopPropagation(); handleAction(false); }} disabled={loading}
                 style={{ background: "var(--accBg)", border: "1px solid var(--acc)", color: "var(--acc)",
-                  cursor: loading ? "wait" : "pointer", padding: "3px 10px", fontSize: 11, fontWeight: 600, borderRadius: 6,
-                  opacity: loading ? 0.5 : 1, transition: "all .15s" }}>
+                  cursor: loading ? "wait" : "pointer", padding: "6px 12px", fontSize: 11, fontWeight: 600, borderRadius: 6,
+                  minHeight: 32, opacity: loading ? 0.5 : 1, transition: "all .15s" }}>
                 {loading ? "..." : actionLabels[insight.action] || insight.action}
               </button>
             )}
@@ -1449,7 +1481,8 @@
           {isMobile && allSessions.length > 0 && (
             <button onClick={() => setShowMobileSidebar(p => !p)}
               style={{ background: showMobileSidebar ? "var(--accBg)" : "var(--glass2)", border: "1px solid " + (showMobileSidebar ? "var(--acc)" : "var(--glass-border)"),
-                color: showMobileSidebar ? "var(--acc)" : "var(--txt3)", cursor: "pointer", padding: "4px 8px", fontSize: 14, borderRadius: 8, flexShrink: 0 }}>
+                color: showMobileSidebar ? "var(--acc)" : "var(--txt3)", cursor: "pointer", padding: "8px 12px", fontSize: 16, borderRadius: 8, flexShrink: 0, minHeight: 40, minWidth: 40,
+                display: "flex", alignItems: "center", justifyContent: "center" }}>
               {"\u2630"}
             </button>
           )}
@@ -1490,11 +1523,14 @@
             ))}
           </div>
           <button onClick={onRefresh} title="Refresh"
-            style={{ background: "transparent", border: "none", color: "var(--txt4)", cursor: "pointer", padding: 6, fontSize: 16,
+            style={{ background: "transparent", border: "none", color: "var(--txt4)", cursor: "pointer",
+              padding: isMobile ? 10 : 6, fontSize: isMobile ? 18 : 16, minHeight: isMobile ? 40 : "auto", minWidth: isMobile ? 40 : "auto",
+              display: "flex", alignItems: "center", justifyContent: "center",
               transition: "color .15s var(--transition-smooth)" }}>{"\u21BB"}</button>
           <button onClick={onClose} title="Close Deep Dive (Esc)"
             style={{ background: "var(--glass2)", border: "1px solid var(--glass-border)", color: "var(--txt)",
-              cursor: "pointer", padding: isMobile ? "6px 10px" : "6px 14px", fontSize: 12, fontWeight: 600, borderRadius: 8,
+              cursor: "pointer", padding: isMobile ? "8px 14px" : "6px 14px", fontSize: isMobile ? 14 : 12, fontWeight: 600, borderRadius: 8,
+              minHeight: isMobile ? 40 : "auto",
               transition: "all .15s var(--transition-smooth)" }}>
             {isMobile ? "\u2715" : "Close"}
           </button>
@@ -1589,11 +1625,11 @@
             {/* Session header (when session selected) */}
             {selectedSession && (
               <div style={{
-                display: "flex", alignItems: "center", gap: 16, marginBottom: 20,
-                padding: "16px 20px", borderRadius: 14, background: "var(--glass)", border: "1px solid var(--glass-border)",
+                display: "flex", alignItems: "center", gap: isMobile ? 10 : 16, marginBottom: 20,
+                padding: isMobile ? "12px 14px" : "16px 20px", borderRadius: 14, background: "var(--glass)", border: "1px solid var(--glass-border)",
                 backdropFilter: "blur(20px)", WebkitBackdropFilter: "blur(20px)", boxShadow: "var(--glass-shd)",
               }}>
-                <SessionHealthRing score={selectedSession.healthScore ?? 100} size={64}/>
+                <SessionHealthRing score={selectedSession.healthScore ?? 100} size={isMobile ? 44 : 64}/>
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 18, fontWeight: 700, color: "var(--txt)", fontFamily: "'Rajdhani',sans-serif" }}>{selectedSession.name}</div>
                   <div style={{ fontSize: 12, color: "var(--txt3)", marginTop: 2 }}>
@@ -1629,27 +1665,28 @@
             {/* Overview header (when no session selected) */}
             {!selectedSession && (
               <div style={{
-                display: "flex", alignItems: "center", gap: 20, marginBottom: 20,
-                padding: "16px 20px", borderRadius: 14, background: "var(--glass)", border: "1px solid var(--glass-border)",
+                display: "flex", alignItems: "center", gap: isMobile ? 12 : 20, marginBottom: 20,
+                padding: isMobile ? "12px 14px" : "16px 20px", borderRadius: 14, background: "var(--glass)", border: "1px solid var(--glass-border)",
                 backdropFilter: "blur(20px)", WebkitBackdropFilter: "blur(20px)", boxShadow: "var(--glass-shd)",
+                flexWrap: isMobile ? "wrap" : "nowrap",
               }}>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 18, fontWeight: 700, color: "var(--txt)", fontFamily: "'Rajdhani',sans-serif" }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: isMobile ? 16 : 18, fontWeight: 700, color: "var(--txt)", fontFamily: "'Rajdhani',sans-serif" }}>
                     {briefing.greeting}
                   </div>
-                  <div style={{ fontSize: 13, color: "var(--txt3)", marginTop: 2 }}>{briefing.summary || briefing.headline}</div>
+                  <div style={{ fontSize: isMobile ? 12 : 13, color: "var(--txt3)", marginTop: 2 }}>{briefing.summary || briefing.headline}</div>
                 </div>
-                <div style={{ display: "flex", gap: 16, flexShrink: 0, textAlign: "center" }}>
+                <div style={{ display: "flex", gap: isMobile ? 12 : 16, flexShrink: 0, textAlign: "center", ...(isMobile ? { width: "100%", justifyContent: "space-around", paddingTop: 8, borderTop: "1px solid var(--glass-border)" } : {}) }}>
                   <div>
-                    <div style={{ fontSize: 24, fontWeight: 700, color: errorCount > 0 ? "var(--red)" : "var(--txt)", fontFamily: "'Rajdhani',sans-serif" }}>{errorCount}</div>
+                    <div style={{ fontSize: isMobile ? 20 : 24, fontWeight: 700, color: errorCount > 0 ? "var(--red)" : "var(--txt)", fontFamily: "'Rajdhani',sans-serif" }}>{errorCount}</div>
                     <div style={{ fontSize: 10, color: "var(--txt4)" }}>Critical</div>
                   </div>
                   <div>
-                    <div style={{ fontSize: 24, fontWeight: 700, color: warningCount > 0 ? "var(--amb)" : "var(--txt)", fontFamily: "'Rajdhani',sans-serif" }}>{warningCount}</div>
+                    <div style={{ fontSize: isMobile ? 20 : 24, fontWeight: 700, color: warningCount > 0 ? "var(--amb)" : "var(--txt)", fontFamily: "'Rajdhani',sans-serif" }}>{warningCount}</div>
                     <div style={{ fontSize: 10, color: "var(--txt4)" }}>Warnings</div>
                   </div>
                   <div>
-                    <div style={{ fontSize: 24, fontWeight: 700, color: "var(--txt3)", fontFamily: "'Rajdhani',sans-serif" }}>{infoCount}</div>
+                    <div style={{ fontSize: isMobile ? 20 : 24, fontWeight: 700, color: "var(--txt3)", fontFamily: "'Rajdhani',sans-serif" }}>{infoCount}</div>
                     <div style={{ fontSize: 10, color: "var(--txt4)" }}>Info</div>
                   </div>
                 </div>
@@ -1742,6 +1779,10 @@
 }
 @keyframes jarvisPanelIn {
   from { opacity: 0; transform: translateY(16px) scale(.92); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes jarvisPanelInDown {
+  from { opacity: 0; transform: translateY(-16px) scale(.92); }
   to   { opacity: 1; transform: translateY(0) scale(1); }
 }
 @keyframes jarvisBadgePop {
