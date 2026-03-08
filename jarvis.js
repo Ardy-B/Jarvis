@@ -759,8 +759,50 @@ class Jarvis {
         summary = `${sessionResults.length} project${sessionResults.length > 1 ? "s" : ""} healthy — nothing needs attention`;
       }
 
+      // Signal quality — % of insights acted on vs dismissed (curriculum L5.5 FASR equivalent)
+      const totalDismissals = this._memory.getDismissals().length;
+      const successfulActions = this._memory.getActions().filter(a => a.outcome === "success").length;
+      const signalTotal = totalDismissals + successfulActions;
+      const signalQuality = signalTotal >= 10 ? Math.round((successfulActions / signalTotal) * 100) : null;
+      if (signalQuality !== null && signalQuality < 20) {
+        globalInsights.push({ id: "signal-low", type: "health", severity: "info",
+          title: `Signal quality: ${signalQuality}% — Jarvis may be too noisy`,
+          detail: "Most insights are being dismissed. Consider raising thresholds or dismissing false positives." });
+      }
+
+      // Cross-project dependency correlation
+      const projectsByPkgName = {};
+      for (const p of this._projects) {
+        try {
+          const pkgPath = path.join(p.folder || "", "package.json");
+          if (p.folder && fs.existsSync(pkgPath)) {
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+            if (pkg.name) projectsByPkgName[pkg.name] = p;
+          }
+        } catch {}
+      }
+      const projectsWithUncommitted = new Set(sessionResults.filter(s => s.git.uncommittedCount > 0).map(s => s.id));
+      for (const result of sessionResults) {
+        const proj = this._projects.find(p => p.id === result.id);
+        if (!proj?.folder) continue;
+        try {
+          const pkgPath = path.join(proj.folder, "package.json");
+          if (!fs.existsSync(pkgPath)) continue;
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+          const allDeps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+          for (const depName of Object.keys(allDeps)) {
+            const depProj = projectsByPkgName[depName];
+            if (depProj && projectsWithUncommitted.has(depProj.id)) {
+              globalInsights.push({ id: `cross-dep-${result.id}-${depProj.id}`, type: "git", severity: "warning",
+                title: `${result.name} depends on ${depProj.name} (has uncommitted changes)`,
+                detail: "Local dependency changes may not be reflected in this project" });
+            }
+          }
+        } catch {}
+      }
+
       const briefing = {
-        greeting: getGreeting(), headline, summary, generatedAt: Date.now(),
+        greeting: getGreeting(), headline, summary, signalQuality, generatedAt: Date.now(),
         sessions: sessionResults,
         globalInsights: globalInsights.filter(i => !this._dismissed.has(i.id)),
         trends: [],

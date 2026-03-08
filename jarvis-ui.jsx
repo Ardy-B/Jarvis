@@ -537,6 +537,9 @@
                     {briefing.greeting || "Jarvis"}
                   </div>
                   <div style={{ fontSize:11, color:"var(--txt3)", lineHeight:1.2 }}>{briefing.headline}</div>
+                  {briefing.summary && briefing.summary !== briefing.headline && (
+                    <div style={{ fontSize:10, color:"var(--txt4)", lineHeight:1.3, marginTop:2, fontStyle:"italic" }}>{briefing.summary}</div>
+                  )}
                 </div>
               </div>
               <div style={{ display:"flex", alignItems:"center", gap:2 }}>
@@ -589,10 +592,34 @@
                 </div>
               )}
 
+              {briefing.trends?.length > 0 && (
+                <div style={{ display:"flex", flexDirection:"column", gap:3 }}>
+                  <div style={{ fontSize:10, fontWeight:700, color:"var(--txt4)", textTransform:"uppercase", letterSpacing:.5 }}>
+                    Trends
+                  </div>
+                  {briefing.trends.map(t => (
+                    <div key={t.id} style={{ fontSize:11, padding:"4px 8px", borderRadius:6,
+                      background:"var(--glass2)", color: t.severity === "warning" ? "var(--amb)" : "var(--txt3)" }}>
+                      <span style={{ fontWeight:600 }}>{t.title}</span>
+                      {t.detail && <span style={{ color:"var(--txt4)" }}> — {t.detail}</span>}
+                    </div>
+                  ))}
+                </div>
+              )}
+
               <div style={{ fontSize:10, color:"var(--txt4)", textAlign:"center", paddingTop:4,
                 paddingBottom: isDesktop ? 0 : "max(4px, env(safe-area-inset-bottom))",
-                borderTop:"1px solid var(--glass-border)" }}>
-                {isDesktop ? "Ctrl+J to toggle" : "Tap orb to toggle"} {"\u00B7"} Drag orb to reposition
+                borderTop:"1px solid var(--glass-border)",
+                display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}>
+                <span>{isDesktop ? "Ctrl+J to toggle" : "Tap orb to toggle"} {"\u00B7"} Drag to reposition</span>
+                {briefing.signalQuality !== null && briefing.signalQuality !== undefined && (
+                  <span style={{ padding:"1px 6px", borderRadius:4,
+                    background: briefing.signalQuality >= 40 ? "var(--glass2)" : "var(--ambBg)",
+                    color: briefing.signalQuality >= 40 ? "var(--txt4)" : "var(--amb)",
+                    fontWeight:600 }}>
+                    signal {briefing.signalQuality}%
+                  </span>
+                )}
               </div>
             </div>
           </div>
