@@ -388,6 +388,133 @@ function analyzeProjectContext(project) {
   return { context, insights };
 }
 
+// ── Content-Aware Adaptation ─────────────────────────────────────────────────
+
+/** Detect project personality from git history and folder shape */
+async function detectProjectPersonality(project) {
+  if (!project.folder || !project.isGit) return {};
+  const cwd = project.folder;
+  try {
+    const [authorsRaw, lastCommitRaw] = await Promise.all([
+      run("git", ["log", "--format=%ae", "-20"], { cwd }).catch(() => ""),
+      run("git", ["log", "-1", "--format=%ct"], { cwd }).catch(() => ""),
+    ]);
+    const uniqueAuthors = new Set(authorsRaw.split("\n").filter(Boolean));
+    const isSoloProject = uniqueAuthors.size <= 1;
+    const daysSinceCommit = lastCommitRaw
+      ? Math.floor((Date.now() - parseInt(lastCommitRaw) * 1000) / (24 * 60 * 60 * 1000))
+      : 0;
+    const isMaintenanceMode = daysSinceCommit > 30;
+    const nameAndPath = `${project.name || ""} ${project.folder || ""}`.toLowerCase();
+    const isAuthSensitive = ["auth", "security", "identity", "oauth", "login", "token"].some(k => nameAndPath.includes(k));
+    return { isSoloProject, isMaintenanceMode, isAuthSensitive, daysSinceCommit, authorCount: uniqueAuthors.size };
+  } catch {
+    return {};
+  }
+}
+
+/** TypeScript-specific health checks */
+function analyzeTypeScriptHealth(project, context) {
+  const insights = [];
+  if (!context?.techStack?.includes("TypeScript") || !project.folder) return insights;
+  const cwd = project.folder;
+  try {
+    const tsconfigPath = path.join(cwd, "tsconfig.json");
+    if (!fs.existsSync(tsconfigPath)) {
+      insights.push({ id: `ts-no-config-${project.id}`, type: "health", severity: "info",
+        title: "TypeScript project missing tsconfig.json",
+        detail: "No TypeScript configuration found in project root" });
+      return insights;
+    }
+    // Strip JSON comments before parsing
+    const raw = fs.readFileSync(tsconfigPath, "utf8").replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    const tsconfig = JSON.parse(raw);
+    const opts = tsconfig.compilerOptions || {};
+    if (!opts.strict && !opts.noImplicitAny) {
+      insights.push({ id: `ts-no-strict-${project.id}`, type: "health", severity: "info",
+        title: "TypeScript strict mode is off",
+        detail: "Enable strict in tsconfig.json to catch implicit any and null errors" });
+    }
+  } catch {}
+  return insights;
+}
+
+/** Python-specific health checks */
+function analyzePythonHealth(project, context) {
+  const insights = [];
+  if (!context?.techStack?.includes("Python") || !project.folder) return insights;
+  const cwd = project.folder;
+  try {
+    const hasVenv = fs.existsSync(path.join(cwd, ".venv")) || fs.existsSync(path.join(cwd, "venv"));
+    if (!hasVenv) {
+      insights.push({ id: `py-no-venv-${project.id}`, type: "health", severity: "info",
+        title: "No virtual environment found",
+        detail: "Create one with: python -m venv .venv" });
+    }
+    const hasReqs = fs.existsSync(path.join(cwd, "requirements.txt"));
+    const hasPyproject = fs.existsSync(path.join(cwd, "pyproject.toml"));
+    if (!hasReqs && !hasPyproject) {
+      insights.push({ id: `py-no-deps-${project.id}`, type: "health", severity: "info",
+        title: "No dependency file found",
+        detail: "Add requirements.txt or pyproject.toml to declare dependencies" });
+    }
+  } catch {}
+  return insights;
+}
+
+/** Next.js-specific health checks */
+function analyzeNextJsHealth(project, context) {
+  const insights = [];
+  if (context?.framework !== "Next.js" || !project.folder) return insights;
+  const cwd = project.folder;
+  try {
+    // Mixed router detection (App + Pages)
+    const hasAppDir   = fs.existsSync(path.join(cwd, "app"))      || fs.existsSync(path.join(cwd, "src", "app"));
+    const hasPagesDir = fs.existsSync(path.join(cwd, "pages"))    || fs.existsSync(path.join(cwd, "src", "pages"));
+    if (hasAppDir && hasPagesDir) {
+      insights.push({ id: `next-mixed-router-${project.id}`, type: "health", severity: "warning",
+        title: "Mixed App Router and Pages Router detected",
+        detail: "Both app/ and pages/ exist — this can cause routing confusion" });
+    }
+    // Missing next.config
+    const hasConfig = ["next.config.js", "next.config.ts", "next.config.mjs"].some(f => fs.existsSync(path.join(cwd, f)));
+    if (!hasConfig) {
+      insights.push({ id: `next-no-config-${project.id}`, type: "health", severity: "info",
+        title: "No next.config file found",
+        detail: "Consider adding next.config.js for redirects, headers, and image domains" });
+    }
+  } catch {}
+  return insights;
+}
+
+/** Post-process insights based on project context and personality */
+function adaptInsightsForContext(insights, context, personality) {
+  return insights.map(insight => {
+    // Python projects: node_modules missing is irrelevant
+    if (context?.techStack?.includes("Python") && insight.id.startsWith("no-modules-")) return null;
+
+    // Solo projects: "working on main" is an expected workflow, downgrade to info
+    if (personality?.isSoloProject && insight.id.startsWith("git-on-main-")) {
+      return { ...insight, severity: "info", detail: "Solo project — direct main commits are common" };
+    }
+
+    // Maintenance mode: stale branch / inactive insights are noise, suppress
+    if (personality?.isMaintenanceMode && insight.id.startsWith("stale-")) return null;
+
+    // Auth-sensitive project: escalate any security warning to error
+    if (personality?.isAuthSensitive && insight.type === "security" && insight.severity === "warning") {
+      return { ...insight, severity: "error", detail: `Auth-sensitive project: ${insight.detail || insight.title}` };
+    }
+
+    // Long-inactive + uncommitted changes: escalate to warning
+    if (insight.id.startsWith("git-uncommitted-") && personality?.daysSinceCommit > 14 && insight.severity === "info") {
+      return { ...insight, severity: "warning", detail: `${insight.detail} — stale for ${personality.daysSinceCommit}d` };
+    }
+
+    return insight;
+  }).filter(Boolean);
+}
+
 // ── Safety Gates ─────────────────────────────────────────────────────────────
 
 async function assessActionRisk(project, action) {
@@ -682,8 +809,11 @@ class Jarvis {
       const sessionResults = [];
       for (const p of projects) {
         try {
-          const gitInsights = await withTimeout(analyzeGitStatus(p), this.scanTimeout).catch(() => []);
-          const codeInsights = await analyzeCodeHealth(p);
+          const [gitInsights, codeInsights, personality] = await Promise.all([
+            withTimeout(analyzeGitStatus(p), this.scanTimeout).catch(() => []),
+            analyzeCodeHealth(p),
+            detectProjectPersonality(p).catch(() => ({})),
+          ]);
           const securityInsights = analyzeSecurityQuick(p);
           const recap = analyzeSessionRecap(p);
 
@@ -696,10 +826,21 @@ class Jarvis {
             } catch {}
           }
 
-          const allInsights = [
+          // Type-specific health checks — only run when relevant stack detected
+          const typeInsights = [
+            ...analyzeTypeScriptHealth(p, projectContext),
+            ...analyzePythonHealth(p, projectContext),
+            ...analyzeNextJsHealth(p, projectContext),
+          ];
+
+          const rawInsights = [
             ...gitInsights.filter(i => i.id),
-            ...recap.insights, ...codeInsights, ...securityInsights, ...contextInsights,
-          ].filter(i => !this._dismissed.has(i.id) && !shouldSuppress(i.id, this._memory));
+            ...recap.insights, ...codeInsights, ...securityInsights, ...contextInsights, ...typeInsights,
+          ];
+
+          // Adapt insights based on project context and personality before filtering
+          const allInsights = adaptInsightsForContext(rawInsights, projectContext, personality)
+            .filter(i => !this._dismissed.has(i.id) && !shouldSuppress(i.id, this._memory));
 
           const branch = gitInsights.branch || null;
           const uncommittedCount = gitInsights.filter(i => i.action === "commit").reduce((n, i) => {
@@ -715,7 +856,7 @@ class Jarvis {
             lastUserMessage: recap.lastUserMessage,
             lastAssistantMessage: recap.lastAssistantMessage,
             git: { branch, uncommittedCount, unpushedCount },
-            insights: allInsights, context: projectContext,
+            insights: allInsights, context: projectContext, personality,
           });
         } catch {}
       }
