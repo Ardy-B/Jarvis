@@ -113,6 +113,39 @@ server.tool(
   }
 );
 
+server.tool(
+  "run_self_improvement",
+  "Trigger Jarvis's self-improvement cycle immediately. Analyzes usage telemetry to auto-suppress noisy insights, update CLAUDE.md learned rules, optimize hooks, generate project rule files, and calibrate workflow recipes. Returns a list of all changes made.",
+  { force: z.boolean().optional().describe("Force a fresh briefing scan before improving (default: use cached)") },
+  async ({ force = false }) => {
+    // Ensure we have a fresh briefing to improve against
+    const briefing = await jarvis.getBriefing(force);
+    // Reset throttle so improvement runs immediately
+    const improver = jarvis.getImprover();
+    improver._lastRun = 0;
+    const changes = await improver.runCycle(
+      briefing,
+      jarvis._hookMgr,
+      jarvis._agentMgr
+    );
+    const summary = changes.length > 0
+      ? `${changes.length} improvement${changes.length !== 1 ? "s" : ""} applied`
+      : "No improvements needed — Jarvis is already well-calibrated";
+    return { content: [{ type: "text", text: JSON.stringify({ summary, changes }, null, 2) }] };
+  }
+);
+
+server.tool(
+  "get_improvement_log",
+  "View Jarvis's self-improvement history — every autonomous change made to hooks, rules, CLAUDE.md, and project rule files, with timestamps and reasons.",
+  { limit: z.number().optional().describe("Max number of log entries to return (default: 50)") },
+  async ({ limit = 50 }) => {
+    const log = jarvis.getImprover().getLog();
+    const entries = log.slice(-limit);
+    return { content: [{ type: "text", text: JSON.stringify({ total: log.length, entries }, null, 2) }] };
+  }
+);
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 const transport = new StdioServerTransport();

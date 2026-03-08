@@ -385,6 +385,8 @@ function analyzeProjectContext(project) {
     }
   } catch {}
 
+  // Expose folder so the self-improver can write project-specific rules
+  context.folder = cwd;
   return { context, insights };
 }
 
@@ -1145,6 +1147,221 @@ Identify frontend performance issues and return prioritized recommendations.
   }
 }
 
+// ── Self-Improvement Engine ───────────────────────────────────────────────────
+//
+// After each briefing cycle, JarvisSelfImprover analyzes its own usage telemetry
+// and autonomously rewrites its configuration to get smarter over time:
+//
+//   1. Signal quality gate  — when noise is high, auto-suppress the noisiest pattern
+//   2. Hook optimization    — adds/removes .claude/settings.json hooks from learned patterns
+//   3. CLAUDE.md rewrite    — live-updates the ## Learned Rules section (no cron job needed)
+//   4. Project rule files   — writes .claude/rules/jarvis-*.md for very strong patterns
+//   5. Workflow calibration — downgrades heavy recipes when they consistently return nothing
+//
+// Every change is logged to .jarvis/improvements.json for full auditability.
+
+class JarvisSelfImprover {
+  constructor(rootDir, memory) {
+    this._rootDir = rootDir;
+    this._memory  = memory;
+    this._logPath = path.join(rootDir, ".jarvis", "improvements.json");
+    this._log     = this._loadLog();
+    this._lastRun = 0;
+    this._minInterval = 5 * 60 * 1000; // at most once per 5 min
+  }
+
+  _loadLog() {
+    try {
+      if (fs.existsSync(this._logPath)) return JSON.parse(fs.readFileSync(this._logPath, "utf8"));
+    } catch {}
+    return { applied: [], version: 1 };
+  }
+
+  _saveLog() {
+    try { fs.writeFileSync(this._logPath, JSON.stringify(this._log, null, 2)); } catch {}
+  }
+
+  _record(change) {
+    this._log.applied.push({ ...change, ts: Date.now() });
+    if (this._log.applied.length > 200) this._log.applied = this._log.applied.slice(-200);
+    this._saveLog();
+  }
+
+  getLog() { return this._log.applied || []; }
+
+  /**
+   * Main improvement cycle — called automatically after each briefing.
+   * Throttled to at most once per 5 minutes. Requires >= 5 data points.
+   * Returns array of { type, reason, ... } change records.
+   */
+  async runCycle(briefing, hookMgr, agentMgr) {
+    if (Date.now() - this._lastRun < this._minInterval) return [];
+    this._lastRun = Date.now();
+
+    const memory    = this._memory;
+    const dismissals = memory.getDismissals();
+    const actions   = memory.getActions();
+    const snapshots = memory.getSnapshots();
+
+    if (dismissals.length + actions.length < 5) return [];
+
+    const changes = [];
+
+    // ── 1. Signal quality gate ─────────────────────────────────────────────────
+    // If most insights are dismissed rather than acted on, Jarvis is too noisy.
+    // Auto-suppress the pattern that's been dismissed most.
+    const successfulActions = actions.filter(a => a.outcome === "success").length;
+    const signalTotal = dismissals.length + successfulActions;
+    if (signalTotal >= 10 && successfulActions / signalTotal < 0.3) {
+      const c = this._suppressNoisiest(dismissals, memory);
+      if (c) changes.push(c);
+    }
+
+    // ── 2. Hook auto-optimization ──────────────────────────────────────────────
+    const hookChanges = hookMgr.autoOptimize(memory);
+    for (const c of hookChanges) changes.push({ type: "hook", ...c });
+
+    // ── 3. Live-rewrite CLAUDE.md Learned Rules ────────────────────────────────
+    const rulesChange = this._rewriteLearnedRules(memory, snapshots.length);
+    if (rulesChange) changes.push(rulesChange);
+
+    // ── 4. Project-specific rule files ────────────────────────────────────────
+    // Write .claude/rules/jarvis-*.md in the project folder for very strong patterns
+    for (const session of (briefing.sessions || [])) {
+      const pChanges = this._generateProjectRules(session, dismissals);
+      changes.push(...pChanges);
+    }
+
+    // ── 5. Workflow calibration ────────────────────────────────────────────────
+    // If a project repeatedly gets a heavy recipe but returns 0 insights, downgrade.
+    for (const session of (briefing.sessions || [])) {
+      if ((session.insights || []).length === 0 && session.workflow === "security-deep") {
+        const ruleId = `workflow-prefer-standard-${session.id}`;
+        if (!memory.getRules().find(r => r.id === ruleId)) {
+          memory.addRule({
+            id: ruleId, type: "workflow-preference", projectId: session.id,
+            preferred: "standard",
+            reason: "security-deep workflow consistently returns 0 insights",
+            confidence: 0.7,
+          });
+          changes.push({ type: "workflow-tune", project: session.name,
+            reason: "deep scan found nothing — calibrated to standard workflow" });
+        }
+      }
+    }
+
+    // ── Record all changes ─────────────────────────────────────────────────────
+    for (const c of changes) this._record(c);
+    return changes;
+  }
+
+  /** Find the most-dismissed pattern and add an auto-suppress rule. */
+  _suppressNoisiest(dismissals, memory) {
+    const counts = {};
+    for (const d of dismissals) {
+      const pattern = d.id.replace(/-[^-]+$/, "");
+      counts[pattern] = (counts[pattern] || 0) + 1;
+    }
+    const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+    if (!top || top[1] < 5) return null;
+    const [pattern, count] = top;
+    const ruleId = `auto-suppress-${pattern}`;
+    if (memory.getRules().find(r => r.id === ruleId)) return null;
+
+    memory.addRule({
+      id: ruleId, type: "auto-suppress", pattern,
+      reason: `Dismissed ${count} times — auto-suppressed by self-improvement (signal quality < 30%)`,
+      confidence: Math.min(count / 10, 1),
+    });
+    return { type: "auto-suppress", pattern, count,
+      reason: `Signal quality below 30% — suppressed noisiest pattern (${count} dismissals)` };
+  }
+
+  /**
+   * Live-rewrite the ## Learned Rules section of CLAUDE.md.
+   * This runs automatically on every improvement cycle, replacing the need for cron/scripts.
+   */
+  _rewriteLearnedRules(memory, snapshotCount) {
+    const claudeMdPath = path.join(this._rootDir, "CLAUDE.md");
+    if (!fs.existsSync(claudeMdPath)) return null;
+    try {
+      const rules      = memory.getRules().filter(r => (r.confidence || 0) >= 0.6);
+      const dismissals = memory.getDismissals();
+      const actions    = memory.getActions();
+      const dateStr    = new Date().toISOString().split("T")[0];
+
+      let section = `## Learned Rules\n_Auto-generated by Jarvis reflection engine · ${dateStr}_\n\n`;
+      if (rules.length === 0) {
+        section += `_No high-confidence rules yet. Keep using Jarvis to build up patterns._\n\n`;
+      } else {
+        for (const r of rules) {
+          const pct = Math.round((r.confidence || 0) * 100);
+          if (r.type === "auto-suppress") {
+            section += `- **Suppress** \`${r.pattern}\`: ${r.reason} (${pct}%)\n`;
+          } else if (r.type === "unreliable-action") {
+            section += `- **Warning** \`${r.action}\` is unreliable: ${r.reason} (${pct}%)\n`;
+          } else if (r.type === "workflow-preference") {
+            section += `- **Workflow** \`${r.projectId}\` → prefer \`${r.preferred}\`: ${r.reason}\n`;
+          }
+        }
+        section += "\n";
+      }
+      section += `_Memory: ${dismissals.length} dismissals · ${actions.length} actions · ${snapshotCount} snapshots_\n`;
+
+      const before  = fs.readFileSync(claudeMdPath, "utf8");
+      const updated = before.replace(/## Learned Rules[\s\S]*$/, section);
+      if (updated === before) return null;
+      fs.writeFileSync(claudeMdPath, updated);
+      return { type: "claude-md", rules: rules.length,
+        reason: `Updated CLAUDE.md — ${rules.length} rule${rules.length !== 1 ? "s" : ""} written` };
+    } catch { return null; }
+  }
+
+  /**
+   * For projects with very strong dismissal patterns (5+ times), write a
+   * .claude/rules/jarvis-{pattern}.md in the project folder so Claude Code
+   * picks it up as a domain rule automatically.
+   */
+  _generateProjectRules(session, allDismissals) {
+    const folder = session.context?.folder;
+    if (!folder) return [];
+    const changes = [];
+
+    // Find patterns dismissed 5+ times specifically for this project
+    const sessionDismissals = allDismissals.filter(d => d.id.includes(session.id));
+    const counts = {};
+    for (const d of sessionDismissals) {
+      const pattern = d.id.replace(/-[^-]+$/, "");
+      counts[pattern] = (counts[pattern] || 0) + 1;
+    }
+
+    const rulesDir = path.join(folder, ".claude", "rules");
+    for (const [pattern, count] of Object.entries(counts)) {
+      if (count < 5) continue;
+      const ruleFile = `jarvis-${pattern}.md`;
+      const rulePath = path.join(rulesDir, ruleFile);
+      if (fs.existsSync(rulePath)) continue;
+      try {
+        if (!fs.existsSync(rulesDir)) fs.mkdirSync(rulesDir, { recursive: true });
+        fs.writeFileSync(rulePath, [
+          `# Jarvis Learned Rule: ${pattern}`,
+          ``,
+          `Auto-generated by Jarvis self-improvement engine.`,
+          ``,
+          `## Rule`,
+          `The insight pattern \`${pattern}\` has been dismissed ${count} times in this project.`,
+          `This is an accepted risk or expected state — do not surface it as an issue.`,
+          ``,
+          `_Generated: ${new Date().toISOString().split("T")[0]}_`,
+        ].join("\n"));
+        changes.push({ type: "project-rule", project: session.name,
+          pattern, file: ruleFile, reason: `Dismissed ${count} times — documented as accepted risk` });
+      } catch {}
+    }
+    return changes;
+  }
+}
+
 // ── Jarvis Class ─────────────────────────────────────────────────────────────
 
 class Jarvis {
@@ -1160,11 +1377,12 @@ class Jarvis {
     const memDir = opts.memoryPath || path.join(path.dirname(__filename), ".jarvis");
     this._memory = new JarvisMemory(path.join(memDir, "memory.json"));
 
-    // Workflow, hook, and agent systems — rootDir defaults to the jarvis.js directory
+    // Workflow, hook, agent, and self-improvement systems
     const rootDir = opts.rootDir || path.dirname(__filename);
     this._workflow  = new JarvisWorkflow();
     this._hookMgr   = new JarvisHookManager(path.join(rootDir, ".claude", "settings.json"));
     this._agentMgr  = new JarvisAgentManager(path.join(rootDir, ".claude", "agents"));
+    this._improver  = new JarvisSelfImprover(rootDir, this._memory);
 
     // Auto-write agent definition files on startup (idempotent)
     try { this._agentMgr.ensureAgents(); } catch {}
@@ -1342,6 +1560,10 @@ class Jarvis {
       // Record snapshot for future trend analysis
       try { this._memory.recordSnapshot(briefing); } catch {}
 
+      // Self-improvement cycle — analyze usage, rewrite rules, tune config
+      // Runs asynchronously so it never blocks the briefing response
+      this._improver.runCycle(briefing, this._hookMgr, this._agentMgr).catch(() => {});
+
       this._cache = { briefing, generatedAt: Date.now(), scanning: false };
       return briefing;
     } catch (err) {
@@ -1358,8 +1580,9 @@ class Jarvis {
     this.invalidateCache();
   }
 
-  // Expose memory for MCP and advanced integrations
-  getMemory() { return this._memory; }
+  // Expose internals for MCP and advanced integrations
+  getMemory()   { return this._memory; }
+  getImprover() { return this._improver; }
   getLearnings() { return this._memory.getRules(); }
   forgetRule(ruleId) { this._memory.removeRule(ruleId); }
 
@@ -1475,6 +1698,30 @@ class Jarvis {
       } catch (err) {
         res.status(500).json({ error: err.message });
       }
+    });
+
+    // ── Self-improvement routes ──
+
+    /** Force-run the improvement cycle immediately (bypasses throttle) and return changes. */
+    app.post(`${prefix}/improve`, ...middlewares, async (req, res) => {
+      try {
+        // Reset throttle so it runs immediately
+        this._improver._lastRun = 0;
+        const briefing = this.getCachedBriefing();
+        if (!briefing) return res.json({ ok: false, message: "No cached briefing — call /briefing first" });
+        const changes = await this._improver.runCycle(briefing, this._hookMgr, this._agentMgr);
+        res.json({ ok: true, changes, message: changes.length > 0
+          ? `${changes.length} improvement${changes.length !== 1 ? "s" : ""} applied`
+          : "No improvements needed — Jarvis is already well-calibrated" });
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    app.get(`${prefix}/improve/log`, ...middlewares, (req, res) => {
+      const log = this._improver.getLog();
+      const limit = parseInt(req.query.limit) || 50;
+      res.json({ improvements: log.slice(-limit), total: log.length });
     });
 
     // ── Workflow routes ──
