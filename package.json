@@ -1,0 +1,8 @@
+{
+  "name": "@vibe/jarvis",
+  "version": "1.0.0",
+  "description": "Proactive project assistant — content-aware briefings, git analysis, security scanning",
+  "main": "jarvis.js",
+  "license": "MIT",
+  "keywords": ["jarvis", "project-assistant", "git-analysis", "briefing"]
+}
