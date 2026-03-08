@@ -50,20 +50,31 @@ async function analyzeGitStatus(project) {
   const cwd = project.folder;
 
   // Run all git commands in parallel (non-blocking)
-  const [statusResult, unpushedResult, branchResult, trackedResult] = await Promise.allSettled([
+  const [statusResult, unpushedResult, branchResult, trackedResult, stashResult, branchAgeResult] = await Promise.allSettled([
     run("git", ["status", "--porcelain"], { cwd }),
     run("git", ["log", "@{u}..HEAD", "--oneline"], { cwd }),
     run("git", ["branch", "--show-current"], { cwd }),
     run("git", ["ls-files", ".env", ".env.local", ".env.production"], { cwd }),
+    run("git", ["stash", "list"], { cwd }),
+    // Branch age: timestamps of commits ahead of main (empty if on main itself)
+    run("git", ["log", "--format=%ct", "main..HEAD"], { cwd })
+      .catch(() => run("git", ["log", "--format=%ct", "master..HEAD"], { cwd })),
   ]);
 
-  // Uncommitted changes
+  // Uncommitted changes + merge conflict detection
   if (statusResult.status === "fulfilled" && statusResult.value) {
     const lines = statusResult.value.split("\n").filter(Boolean);
-    if (lines.length > 0) {
-      insights.push({ id: `git-uncommitted-${project.id}`, type: "git", severity: lines.length > 5 ? "warning" : "info",
-        title: `${lines.length} uncommitted change${lines.length > 1 ? "s" : ""}`,
-        detail: lines.slice(0, 3).map(l => l.trim()).join(", ") + (lines.length > 3 ? ` +${lines.length - 3} more` : ""),
+    const conflicted = lines.filter(l => /^(UU|AA|DD|AU|UA|DU|UD) /.test(l));
+    if (conflicted.length > 0) {
+      insights.push({ id: `git-conflicts-${project.id}`, type: "git", severity: "error",
+        title: `${conflicted.length} merge conflict${conflicted.length > 1 ? "s" : ""}`,
+        detail: conflicted.slice(0, 2).map(l => l.slice(3).trim()).join(", ") });
+    }
+    const uncommitted = lines.filter(l => !/^(UU|AA|DD|AU|UA|DU|UD) /.test(l));
+    if (uncommitted.length > 0) {
+      insights.push({ id: `git-uncommitted-${project.id}`, type: "git", severity: uncommitted.length > 5 ? "warning" : "info",
+        title: `${uncommitted.length} uncommitted change${uncommitted.length > 1 ? "s" : ""}`,
+        detail: uncommitted.slice(0, 3).map(l => l.trim()).join(", ") + (uncommitted.length > 3 ? ` +${uncommitted.length - 3} more` : ""),
         action: "commit" });
     }
   }
@@ -78,7 +89,7 @@ async function analyzeGitStatus(project) {
     }
   }
 
-  // Current branch
+  // Current branch + long-lived branch detection
   if (branchResult.status === "fulfilled" && branchResult.value) {
     const branch = branchResult.value;
     insights.branch = branch;
@@ -86,6 +97,28 @@ async function analyzeGitStatus(project) {
       insights.push({ id: `git-on-main-${project.id}`, type: "git", severity: "warning",
         title: "Working directly on " + branch,
         detail: "Consider creating a feature branch", action: "branch" });
+    }
+    // Long-lived branch (non-main branches open > 7 days)
+    if (branch && branch !== "main" && branch !== "master" && branchAgeResult.status === "fulfilled" && branchAgeResult.value) {
+      const timestamps = branchAgeResult.value.split("\n").filter(Boolean).map(Number).filter(Boolean);
+      if (timestamps.length > 0) {
+        const ageDays = Math.floor((Date.now() - Math.min(...timestamps) * 1000) / (24 * 60 * 60 * 1000));
+        if (ageDays >= 7) {
+          insights.push({ id: `git-stale-branch-${project.id}`, type: "git", severity: "info",
+            title: `Branch open for ${ageDays} day${ageDays !== 1 ? "s" : ""}`,
+            detail: `"${branch}" — consider merging or rebasing` });
+        }
+      }
+    }
+  }
+
+  // Stash entries
+  if (stashResult.status === "fulfilled" && stashResult.value) {
+    const entries = stashResult.value.split("\n").filter(Boolean);
+    if (entries.length > 0) {
+      insights.push({ id: `git-stash-${project.id}`, type: "git", severity: "info",
+        title: `${entries.length} stash${entries.length > 1 ? "es" : ""} saved`,
+        detail: entries[0].replace(/^stash@\{\d+\}: /, "").slice(0, 60) });
     }
   }
 
@@ -129,7 +162,7 @@ function analyzeSessionRecap(project) {
   return { insights, lastUserMessage, lastAssistantMessage, lastActivityAt };
 }
 
-function analyzeCodeHealth(project) {
+async function analyzeCodeHealth(project) {
   const insights = [];
   if (!project.folder) return insights;
   const cwd = project.folder;
@@ -145,7 +178,33 @@ function analyzeCodeHealth(project) {
     }
   } catch {}
 
-  // Skip the expensive grep for TODOs — not worth spawning a shell for every project
+  // Smart TODOs — only in files modified in the last 3 commits (high signal, low noise)
+  if (project.isGit) {
+    try {
+      const recentFiles = await run("git", ["diff", "--name-only", "HEAD~3..HEAD"], { cwd }).catch(() => "");
+      const files = (recentFiles || "").split("\n").filter(f => f && /\.(js|ts|jsx|tsx|py|go|rs|java|cs)$/.test(f));
+      const todoRe = /\/\/\s*(TODO|FIXME|HACK|XXX)[\s:]/i;
+      const found = [];
+      for (const file of files.slice(0, 8)) {
+        try {
+          const content = fs.readFileSync(path.join(cwd, file), "utf8").slice(0, 12000);
+          const lines = content.split("\n");
+          for (let i = 0; i < lines.length; i++) {
+            if (todoRe.test(lines[i])) {
+              found.push({ file, line: i + 1, text: lines[i].trim().slice(0, 60) });
+              break; // one per file
+            }
+          }
+        } catch {}
+      }
+      if (found.length > 0) {
+        insights.push({ id: `todos-${project.id}`, type: "health", severity: "info",
+          title: `${found.length} TODO${found.length > 1 ? "s" : ""} in recently changed files`,
+          detail: `${found[0].file}:${found[0].line} — ${found[0].text}` });
+      }
+    } catch {}
+  }
+
   return insights;
 }
 
@@ -172,21 +231,40 @@ function analyzeSecurityQuick(project) {
     } catch {}
   }
 
-  // Quick secret scan — only top-level non-dot files, limited to 5 files
+  // Extended secret scanning — top-level files + src/ directory
   try {
-    const topFiles = fs.readdirSync(cwd).filter(f => {
-      if (f.startsWith(".") || f === "node_modules" || f === "repos") return false;
-      try { return fs.statSync(path.join(cwd, f)).isFile(); } catch { return false; }
-    });
-    const secretPattern = /(?:api[_-]?key|secret|password|token)\s*[:=]\s*["'][^"']{8,}/i;
-    for (const file of topFiles.slice(0, 5)) {
+    const secretPatterns = [
+      { re: /(?:api[_-]?key|secret|password|token)\s*[:=]\s*["'][^"']{8,}/i, label: "API key or secret" },
+      { re: /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/, label: "private key" },
+      { re: /(?:mongodb|postgresql|mysql|redis):\/\/[^:@\s]+:[^@\s]+@/, label: "DB connection string" },
+      { re: /(?:JWT_SECRET|SECRET_KEY|SIGNING_SECRET|AUTH_SECRET)\s*[:=]\s*["'][^"']{8,}/i, label: "JWT/signing secret" },
+    ];
+    const isFile = f => { try { return fs.statSync(f).isFile(); } catch { return false; } };
+    const ignoreFile = f => /\.example$|\.sample$|\.template$|\.test\.|\.spec\./.test(f);
+
+    const topFiles = fs.readdirSync(cwd)
+      .filter(f => !f.startsWith(".") && f !== "node_modules" && f !== "repos" && f !== "dist" && f !== "build")
+      .filter(f => isFile(path.join(cwd, f)))
+      .slice(0, 5)
+      .map(f => path.join(cwd, f));
+
+    const srcDir = path.join(cwd, "src");
+    const srcFiles = fs.existsSync(srcDir)
+      ? fs.readdirSync(srcDir).filter(f => isFile(path.join(srcDir, f))).slice(0, 8).map(f => path.join(srcDir, f))
+      : [];
+
+    for (const filePath of [...topFiles, ...srcFiles]) {
+      if (ignoreFile(filePath)) continue;
       try {
-        const content = fs.readFileSync(path.join(cwd, file), "utf8").slice(0, 5000);
-        if (secretPattern.test(content) && !file.match(/\.example$|\.sample$|\.template$/)) {
-          insights.push({ id: `secret-${project.id}-${file}`, type: "security", severity: "warning",
-            title: `Possible secret in ${file}`,
-            detail: "Found pattern matching API key or password" });
-          break; // One warning is enough
+        const content = fs.readFileSync(filePath, "utf8").slice(0, 8000);
+        for (const { re, label } of secretPatterns) {
+          if (re.test(content)) {
+            const rel = path.relative(cwd, filePath);
+            insights.push({ id: `secret-${project.id}-${rel}`, type: "security", severity: "warning",
+              title: `Possible ${label} in ${rel}`,
+              detail: "Matches a known secret pattern — verify this is not a real credential" });
+            return insights; // One warning is enough
+          }
         }
       } catch {}
     }
@@ -605,7 +683,7 @@ class Jarvis {
       for (const p of projects) {
         try {
           const gitInsights = await withTimeout(analyzeGitStatus(p), this.scanTimeout).catch(() => []);
-          const codeInsights = analyzeCodeHealth(p);
+          const codeInsights = await analyzeCodeHealth(p);
           const securityInsights = analyzeSecurityQuick(p);
           const recap = analyzeSessionRecap(p);
 
@@ -666,8 +744,23 @@ class Jarvis {
         headline = "No projects open yet \u2014 ready when you are";
       }
 
+      // Natural language summary — useful for MCP tool responses and quick reads
+      const totalErrors   = sessionResults.reduce((n, s) => n + s.insights.filter(i => i.severity === "error").length, 0);
+      const totalWarnings = sessionResults.reduce((n, s) => n + s.insights.filter(i => i.severity === "warning").length, 0);
+      let summary = "";
+      if (totalErrors > 0 || totalWarnings > 0) {
+        const parts = [];
+        if (totalErrors   > 0) parts.push(`${totalErrors} critical issue${totalErrors > 1 ? "s" : ""}`);
+        if (totalWarnings > 0) parts.push(`${totalWarnings} warning${totalWarnings > 1 ? "s" : ""}`);
+        const affected = sessionResults.filter(s => s.insights.some(i => i.severity === "error" || i.severity === "warning"))
+          .slice(0, 2).map(s => s.name);
+        summary = `${parts.join(" and ")} across ${affected.length > 0 ? affected.join(" and ") : "your projects"}`;
+      } else if (sessionResults.length > 0) {
+        summary = `${sessionResults.length} project${sessionResults.length > 1 ? "s" : ""} healthy — nothing needs attention`;
+      }
+
       const briefing = {
-        greeting: getGreeting(), headline, generatedAt: Date.now(),
+        greeting: getGreeting(), headline, summary, generatedAt: Date.now(),
         sessions: sessionResults,
         globalInsights: globalInsights.filter(i => !this._dismissed.has(i.id)),
         trends: [],
