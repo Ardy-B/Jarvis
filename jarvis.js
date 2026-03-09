@@ -727,7 +727,7 @@ async function analyzeBusFactor(project) {
 }
 
 /** Post-process insights based on project context and personality */
-function adaptInsightsForContext(insights, context, personality) {
+function adaptInsightsForContext(insights, context, personality, rules = []) {
   return insights.map(insight => {
     // Python projects: node_modules missing is irrelevant
     if (context?.techStack?.includes("Python") && insight.id.startsWith("no-modules-")) return null;
@@ -750,6 +750,12 @@ function adaptInsightsForContext(insights, context, personality) {
       return { ...insight, severity: "warning", detail: `${insight.detail} — stale for ${personality.daysSinceCommit}d` };
     }
 
+    // Severity calibration — learned from engagement/dismissal patterns
+    const calRule = rules.find(r => r.type === "severity-calibration"
+      && r.insightType === insight.type && r.fromSeverity === insight.severity);
+    if (calRule) return { ...insight, severity: calRule.toSeverity,
+      detail: `${insight.detail || insight.title} (calibrated: ${calRule.reason})` };
+
     return insight;
   }).filter(Boolean);
 }
@@ -770,7 +776,7 @@ function computeHealthScore(insights, context, personality) {
 }
 
 /** Add a numeric priority field (0-10) to an insight. Higher = show first. */
-function scoreInsight(insight, personality) {
+function scoreInsight(insight, personality, rules = []) {
   let p = 0;
   if (insight.severity === "error")        p += 6;
   else if (insight.severity === "warning") p += 3;
@@ -779,6 +785,9 @@ function scoreInsight(insight, personality) {
   if (insight.type === "git")      p += 1;
   if (personality?.isAuthSensitive && insight.type === "security") p += 1;
   if (personality?.isSoloProject && insight.type === "git")        p -= 1;
+  // Priority boost from positive reinforcement learning
+  const boostRule = rules.find(r => r.type === "priority-boost" && r.insightType === insight.type);
+  if (boostRule) p += boostRule.boost;
   return { ...insight, priority: Math.max(0, Math.min(10, p)) };
 }
 
@@ -960,16 +969,18 @@ async function assessActionRisk(project, action) {
 class JarvisMemory {
   constructor(memoryPath) {
     this._path = memoryPath;
-    this._data = { snapshots: [], dismissals: [], actions: [], rules: [], version: 1,
+    this._data = { snapshots: [], dismissals: [], actions: [], rules: [], engagements: [], version: 1,
       proposals: { approved: [], rejected: [], deferred: [] } };
     this._maxSnapshots = 50;
     this._maxDismissals = 200;
     this._maxActions = 200;
+    this._maxEngagements = 200;
     this._dirty = false;
     this._saveTimer = null;
     this._saveDebounceMs = 5000; // flush at most every 5s
     this._lastDismissalCount = 0;  // watermarks for change detection
     this._lastActionCount = 0;
+    this._lastEngagementCount = 0;
     this._rulesHash = "";
     this._load();
     this._updateWatermarks();
@@ -986,7 +997,10 @@ class JarvisMemory {
       if (fs.existsSync(this._path)) {
         const raw = fs.readFileSync(this._path, "utf8");
         const parsed = JSON.parse(raw);
-        if (parsed && parsed.version) this._data = parsed;
+        if (parsed && parsed.version) {
+          if (!parsed.engagements) parsed.engagements = [];
+          this._data = parsed;
+        }
       }
     } catch {}
   }
@@ -1015,6 +1029,7 @@ class JarvisMemory {
   _updateWatermarks() {
     this._lastDismissalCount = this._data.dismissals.length;
     this._lastActionCount = this._data.actions.length;
+    this._lastEngagementCount = (this._data.engagements || []).length;
     this._rulesHash = this._computeRulesHash();
   }
 
@@ -1025,7 +1040,8 @@ class JarvisMemory {
   // Check if new dismissals/actions have been recorded since last reflection
   hasNewData() {
     return this._data.dismissals.length > this._lastDismissalCount
-        || this._data.actions.length > this._lastActionCount;
+        || this._data.actions.length > this._lastActionCount
+        || (this._data.engagements || []).length > this._lastEngagementCount;
   }
 
   // Check if rules have changed since last check
@@ -1041,8 +1057,11 @@ class JarvisMemory {
   // Record a briefing snapshot (compact form — just insight IDs, severities, counts)
   recordSnapshot(briefing) {
     if (!briefing || !briefing.sessions) return;
+    const now = new Date();
     const snapshot = {
       ts: Date.now(),
+      dayOfWeek: now.getDay(),
+      hourOfDay: now.getHours(),
       projectCount: briefing.sessions.length,
       insights: [],
       totalErrors: 0,
@@ -1063,8 +1082,8 @@ class JarvisMemory {
   }
 
   // Record a dismissal — used by reflection to detect false-positive patterns
-  recordDismissal(insightId) {
-    this._data.dismissals.push({ id: insightId, ts: Date.now() });
+  recordDismissal(insightId, severity = null, type = null) {
+    this._data.dismissals.push({ id: insightId, ts: Date.now(), severity, type });
     if (this._data.dismissals.length > this._maxDismissals) {
       this._data.dismissals = this._data.dismissals.slice(-this._maxDismissals);
     }
@@ -1096,6 +1115,16 @@ class JarvisMemory {
     this._save();
   }
 
+  // Record an engagement — user acted on an insight (positive reinforcement)
+  recordEngagement(insightId, type, severity) {
+    if (!this._data.engagements) this._data.engagements = [];
+    this._data.engagements.push({ id: insightId, type, severity, ts: Date.now() });
+    if (this._data.engagements.length > this._maxEngagements)
+      this._data.engagements = this._data.engagements.slice(-this._maxEngagements);
+    this._save();
+  }
+
+  getEngagements() { return this._data.engagements || []; }
   getRules() { return this._data.rules || []; }
   getSnapshots() { return this._data.snapshots || []; }
   getDismissals() { return this._data.dismissals || []; }
@@ -1106,9 +1135,12 @@ class JarvisMemory {
     if (!this._data.proposals) this._data.proposals = { approved: [], rejected: [], deferred: [] };
   }
 
-  recordProposalApproval(proposalId, outcome) {
+  recordProposalApproval(proposalId, outcome, relatedInsights = []) {
     this._ensureProposals();
-    this._data.proposals.approved.push({ id: proposalId, outcome, ts: Date.now() });
+    this._data.proposals.approved.push({
+      id: proposalId, outcome, ts: Date.now(), relatedInsights,
+      validatedAt: null, validationResult: null,
+    });
     if (this._data.proposals.approved.length > 100) {
       this._data.proposals.approved = this._data.proposals.approved.slice(-100);
     }
@@ -1270,6 +1302,29 @@ function reflect(memory) {
     }
   }
 
+  // Pattern: frequently engaged insight types → boost priority (positive reinforcement)
+  const engagements = memory.getEngagements();
+  if (engagements.length >= 5) {
+    const engByType = {}, disByType = {};
+    for (const e of engagements) { if (e.type) engByType[e.type] = (engByType[e.type] || 0) + 1; }
+    for (const d of dismissals) { if (d.type) disByType[d.type] = (disByType[d.type] || 0) + 1; }
+    for (const [insightType, engCount] of Object.entries(engByType)) {
+      const disCount = disByType[insightType] || 0;
+      const total = engCount + disCount;
+      if (total >= 5) {
+        const rate = engCount / total;
+        if (rate > 0.6) {
+          const boost = rate > 0.8 ? 3 : rate > 0.7 ? 2 : 1;
+          const ruleId = `priority-boost-${insightType}`;
+          if (!memory.getRules().find(r => r.id === ruleId)) {
+            learnings.push({ id: ruleId, type: "priority-boost", insightType, boost, confidence: rate,
+              reason: `${Math.round(rate*100)}% engagement rate for ${insightType} insights` });
+          }
+        }
+      }
+    }
+  }
+
   // Persist high-confidence learnings as rules
   for (const learning of learnings) {
     if (learning.confidence >= 0.6) {
@@ -1285,6 +1340,182 @@ function shouldSuppress(insightId, memory) {
   const rules = memory.getRules().filter(r => r.type === "auto-suppress");
   const pattern = insightId.replace(/-[^-]+$/, "");
   return rules.some(r => r.pattern === pattern);
+}
+
+// ── Severity Calibration ─────────────────────────────────────────────────────
+// Learns from engagement/dismissal patterns to upgrade or downgrade severity
+// for specific insight types.
+
+function calibrateSeverity(memory) {
+  const engagements = memory.getEngagements();
+  const dismissals = memory.getDismissals();
+  if (engagements.length + dismissals.length < 10) return [];
+  const changes = [];
+  const engByTypeSev = {}, disByTypeSev = {};
+  for (const e of engagements) {
+    if (e.type && e.severity) { const k = `${e.type}:${e.severity}`; engByTypeSev[k] = (engByTypeSev[k] || 0) + 1; }
+  }
+  for (const d of dismissals) {
+    if (d.type && d.severity) { const k = `${d.type}:${d.severity}`; disByTypeSev[k] = (disByTypeSev[k] || 0) + 1; }
+  }
+  const allKeys = new Set([...Object.keys(engByTypeSev), ...Object.keys(disByTypeSev)]);
+  for (const key of allKeys) {
+    const eng = engByTypeSev[key] || 0, dis = disByTypeSev[key] || 0, total = eng + dis;
+    if (total < 5) continue;
+    const [insightType, severity] = key.split(":");
+    const rate = eng / total;
+    const ruleId = `severity-calibration-${insightType}-${severity}`;
+    if (memory.getRules().find(r => r.id === ruleId)) continue;
+    if (severity === "warning" && rate < 0.2) {
+      changes.push({ id: ruleId, type: "severity-calibration", insightType,
+        fromSeverity: "warning", toSeverity: "info", confidence: 1 - rate,
+        reason: `${insightType} warnings acted on only ${Math.round(rate*100)}% — downgrading to info` });
+    } else if (severity === "info" && rate > 0.6) {
+      changes.push({ id: ruleId, type: "severity-calibration", insightType,
+        fromSeverity: "info", toSeverity: "warning", confidence: rate,
+        reason: `${insightType} info acted on ${Math.round(rate*100)}% — upgrading to warning` });
+    }
+  }
+  return changes;
+}
+
+// ── Cross-Session Temporal Pattern Detection ─────────────────────────────────
+// Analyzes historical snapshots for day-of-week, recovery, and cyclic patterns.
+
+function detectTemporalPatterns(snapshots) {
+  if (snapshots.length < 10) return [];
+  const patterns = [];
+  const dayNames = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+
+  // A. Day-of-week health patterns
+  const dayStats = {};
+  for (const s of snapshots) {
+    if (s.dayOfWeek == null) continue;
+    if (!dayStats[s.dayOfWeek]) dayStats[s.dayOfWeek] = { totalErrors: 0, totalWarnings: 0, count: 0 };
+    dayStats[s.dayOfWeek].totalErrors += s.totalErrors;
+    dayStats[s.dayOfWeek].totalWarnings += s.totalWarnings;
+    dayStats[s.dayOfWeek].count++;
+  }
+  const avgErrors = snapshots.reduce((s, sn) => s + sn.totalErrors, 0) / snapshots.length;
+  for (const [day, stats] of Object.entries(dayStats)) {
+    if (stats.count < 3) continue;
+    const avgDayErrors = stats.totalErrors / stats.count;
+    if (avgDayErrors > avgErrors * 1.5 && avgDayErrors >= 2) {
+      patterns.push({ id: `temporal-day-errors-${day}`, type: "temporal-pattern",
+        pattern: "day-of-week-errors", dayOfWeek: +day, metric: "errors", direction: "up",
+        confidence: Math.min(stats.count / 10, 1),
+        reason: `Errors tend to spike on ${dayNames[day]}s (avg ${avgDayErrors.toFixed(1)} vs overall ${avgErrors.toFixed(1)})` });
+    }
+  }
+
+  // B. Recovery cycles — consecutive snapshots where errors decreased significantly
+  let recoveryCycles = 0;
+  for (let i = 1; i < snapshots.length; i++) {
+    if (snapshots[i-1].totalErrors > snapshots[i].totalErrors + 2) recoveryCycles++;
+  }
+  if (recoveryCycles >= 3) {
+    patterns.push({ id: "temporal-recovery-pattern", type: "temporal-pattern",
+      pattern: "recovery-cycles", metric: "errors", direction: "down",
+      confidence: Math.min(recoveryCycles / 5, 1),
+      reason: `${recoveryCycles} recovery cycles detected — issues tend to self-resolve between check-ins` });
+  }
+
+  // C. Recurring/cyclic issues — appear and disappear repeatedly
+  const insightAppearances = {};
+  for (const s of snapshots) {
+    const ids = new Set(s.insights.map(i => i.id));
+    for (const id of ids) insightAppearances[id] = (insightAppearances[id] || 0) + 1;
+  }
+  const cyclic = Object.entries(insightAppearances)
+    .filter(([, count]) => count >= 3 && count < snapshots.length * 0.9)
+    .sort((a, b) => b[1] - a[1]).slice(0, 3);
+  if (cyclic.length > 0) {
+    patterns.push({ id: "temporal-cyclic-issues", type: "temporal-pattern",
+      pattern: "cyclic-issues", metric: "recurrence", direction: "cyclic",
+      confidence: Math.min(cyclic[0][1] / snapshots.length, 1),
+      reason: `Recurring issues: ${cyclic.map(([id, c]) => `${id.replace(/-[^-]+$/, "")} (${c}x)`).join(", ")}`,
+      cyclicInsights: cyclic.map(([id]) => id) });
+  }
+  return patterns;
+}
+
+// ── Proposal Follow-Up Validation ────────────────────────────────────────────
+// Validates whether approved proposals actually resolved the issues they were
+// supposed to fix, and tracks proposal type effectiveness.
+
+function validateProposalOutcomes(memory, currentBriefing) {
+  if (!currentBriefing) return [];
+  const approved = memory.getApprovedProposals();
+  const changes = [];
+  const currentInsightIds = new Set(
+    (currentBriefing.sessions || []).flatMap(s => (s.insights || []).map(i => i.id))
+  );
+  for (const approval of approved) {
+    if (approval.validatedAt || !approval.relatedInsights?.length) continue;
+    const postApprovalSnapshots = memory.getSnapshots().filter(s => s.ts > approval.ts);
+    if (postApprovalSnapshots.length < 2) continue;
+    const resolved = approval.relatedInsights.filter(id => !currentInsightIds.has(id));
+    const resolutionRate = resolved.length / approval.relatedInsights.length;
+    approval.validatedAt = Date.now();
+    approval.validationResult = { validated: resolutionRate > 0.3, insightsResolved: resolved, resolutionRate };
+    // Track proposal type effectiveness
+    const proposalType = approval.id.replace(/^proposal-/, "").replace(/-.*$/, "");
+    const effectivenessId = `proposal-effectiveness-${proposalType}`;
+    const existing = memory.getRules().find(r => r.id === effectivenessId);
+    if (existing) {
+      existing.confidence = existing.confidence * 0.7 + (resolutionRate > 0.3 ? 1 : 0) * 0.3;
+      memory.addRule(existing);
+    } else {
+      memory.addRule({ id: effectivenessId, type: "proposal-effectiveness", proposalType,
+        confidence: resolutionRate > 0.3 ? 0.7 : 0.3,
+        reason: `Effectiveness tracking for ${proposalType} proposals` });
+    }
+    changes.push({ type: "proposal-validation", proposalId: approval.id, validated: resolutionRate > 0.3, resolved: resolved.length });
+  }
+  memory._save();
+  return changes;
+}
+
+// ── Proactive Observation Nudges ─────────────────────────────────────────────
+// Surfaces gentle suggestions based on validated observation patterns.
+
+function generateProactiveNudges(projects, sessionIntel, memory) {
+  const nudges = [];
+  for (const project of projects) {
+    if (!project.folder) continue;
+    const observations = sessionIntel._observationAges[project.id] || {};
+    const output = project.output || [];
+    if (output.length < 10) continue;
+    const recentEntries = output.slice(-30);
+
+    // A. Test before commit nudge (only if observation validated)
+    if (observations.testBeforeCommit?.lastCorrelated) {
+      try {
+        const hasRecentEdit = recentEntries.some(e => /edit|write/i.test(e.toolUse?.name || ""));
+        const hasRecentTest = recentEntries.some(e => /npm\s+test|jest|pytest|vitest|mocha/i.test(e.toolUse?.input?.command || ""));
+        const hasRecentCommit = recentEntries.some(e => /git\s+commit/i.test(e.toolUse?.input?.command || ""));
+        if (hasRecentEdit && !hasRecentTest && !hasRecentCommit)
+          nudges.push({ id: `nudge-test-${project.id}`, title: "Run tests before committing?",
+            detail: `You usually test before commits in ${project.name}`, action: null, confidence: 0.7, observationSource: "testBeforeCommit" });
+      } catch {}
+    }
+
+    // B. Commit cadence nudge (only if observation validated)
+    if (observations.commitCadence?.lastCorrelated) {
+      try {
+        let editsSinceLastCommit = 0;
+        for (let i = output.length - 1; i >= Math.max(0, output.length - 100); i--) {
+          if (/edit|write/i.test(output[i].toolUse?.name || "")) editsSinceLastCommit++;
+          if (/git\s+commit/i.test(output[i].toolUse?.input?.command || "")) break;
+        }
+        if (editsSinceLastCommit >= 8)
+          nudges.push({ id: `nudge-commit-${project.id}`, title: "Time to commit?",
+            detail: `${editsSinceLastCommit} edits since last commit — consider saving a checkpoint`,
+            action: "commit", confidence: 0.6, observationSource: "commitCadence" });
+      } catch {}
+    }
+  }
+  return nudges.sort((a, b) => b.confidence - a.confidence).slice(0, 2);
 }
 
 // ── Proposal Generation ──────────────────────────────────────────────────────
@@ -1307,6 +1538,13 @@ function generateProposals(projects, memory, capabilities) {
     ...detectCapabilityGapProposals(projects, capabilities, excluded),
     ...detectMcpOpportunities(projects, excluded),
   ];
+
+  // Apply proposal effectiveness learning — downgrade low-effectiveness types
+  const effectivenessRules = memory.getRules().filter(r => r.type === "proposal-effectiveness");
+  for (const p of proposals) {
+    const effRule = effectivenessRules.find(r => p.proposalType === r.proposalType);
+    if (effRule && effRule.confidence < 0.3) p.confidence *= 0.5;
+  }
 
   // Filter excluded, sort by confidence descending, cap at 5
   return proposals
@@ -2009,6 +2247,9 @@ class SessionIntelligence {
    */
   analyze(project) {
     try {
+      // Route chat/API sessions to specialized analyzer
+      if (project.sessionType === "chat") return this._analyzeChat(project.output || []);
+
       const output = project.output || [];
       if (output.length === 0) return null;
 
@@ -2327,6 +2568,56 @@ class SessionIntelligence {
   }
 
   /**
+   * Analyze chat/API session output for behavioral signals.
+   * Chat sessions have different patterns than CLI sessions.
+   */
+  _analyzeChat(output) {
+    const signals = { hotFiles: null, commitCadence: null, workHours: null,
+      testBeforeCommit: null, recurringErrors: null, commandFrequency: null,
+      sessionAvgDuration: null, chatQuestionTypes: null, chatResponseLength: null };
+    try {
+      const times = output.map(e => e.time).filter(t => t && t > 0);
+      if (times.length >= 3) {
+        const hours = times.map(t => new Date(t).getHours());
+        const hourCounts = {};
+        for (const h of hours) hourCounts[h] = (hourCounts[h] || 0) + 1;
+        const peakHour = +Object.entries(hourCounts).sort((a, b) => b[1] - a[1])[0][0];
+        signals.workHours = { start: Math.min(...hours), end: Math.max(...hours), peakHour };
+      }
+    } catch {}
+    try {
+      const userMsgs = output.filter(e => e.role === "user" && e.text);
+      const qTypes = { debugging: 0, architecture: 0, review: 0, howto: 0, other: 0 };
+      const kw = {
+        debugging: /error|bug|fix|crash|fail|broken|issue|debug|stack\s*trace/i,
+        architecture: /architect|design|pattern|structure|refactor|approach|should\s+I/i,
+        review: /review|check|look\s+at|what\s+do\s+you\s+think|correct|improve/i,
+        howto: /how\s+(?:to|do|can)|what\s+is|explain|tutorial|example|show\s+me/i,
+      };
+      for (const msg of userMsgs) {
+        let matched = false;
+        for (const [type, regex] of Object.entries(kw)) {
+          if (regex.test(msg.text)) { qTypes[type]++; matched = true; break; }
+        }
+        if (!matched) qTypes.other++;
+      }
+      const totalQ = Object.values(qTypes).reduce((a, b) => a + b, 0);
+      if (totalQ >= 3) signals.chatQuestionTypes = qTypes;
+    } catch {}
+    try {
+      const assistantMsgs = output.filter(e => e.role === "assistant" && e.text);
+      if (assistantMsgs.length >= 3) {
+        const lengths = assistantMsgs.map(m => m.text.length);
+        signals.chatResponseLength = {
+          avg: Math.round(lengths.reduce((a, b) => a + b, 0) / lengths.length),
+          max: Math.max(...lengths),
+        };
+      }
+    } catch {}
+    return Object.values(signals).some(v => v !== null) ? signals : null;
+  }
+
+  /**
    * Aggregate signals across multiple projects to find universal patterns.
    */
   aggregateAcrossProjects(projectSignals) {
@@ -2375,6 +2666,22 @@ class SessionIntelligence {
       const topGlobalErrors = Object.values(allErrors).sort((a, b) => b.count - a.count).slice(0, 3);
       if (topGlobalErrors.length > 0 && topGlobalErrors[0].count >= 3) {
         global.recurringErrorsGlobal = topGlobalErrors;
+      }
+
+      // Chat session aggregation — detect dominant question types
+      const allQuestionTypes = {};
+      let chatCount = 0;
+      for (const [, signals] of projectSignals) {
+        if (signals.chatQuestionTypes) {
+          chatCount++;
+          for (const [type, count] of Object.entries(signals.chatQuestionTypes))
+            allQuestionTypes[type] = (allQuestionTypes[type] || 0) + count;
+        }
+      }
+      if (chatCount >= 1) {
+        const topType = Object.entries(allQuestionTypes).sort((a, b) => b[1] - a[1])[0];
+        if (topType && topType[1] >= 5)
+          global.universalPatterns = (global.universalPatterns || []).concat(`Chat focus: ${topType[0]} (${topType[1]} questions)`);
       }
 
       return global;
@@ -2518,6 +2825,26 @@ class JarvisSelfImprover {
       } catch {}
     }
 
+    // ── 7. Severity calibration ──────────────────────────────────────────────
+    const calChanges = calibrateSeverity(memory);
+    for (const c of calChanges) {
+      if (c.confidence >= 0.6) memory.addRule(c);
+      changes.push({ type: "severity-calibration", ...c });
+    }
+
+    // ── 8. Temporal pattern detection ────────────────────────────────────────
+    const temporalPatterns = detectTemporalPatterns(snapshots);
+    for (const p of temporalPatterns) {
+      if (p.confidence >= 0.6 && !memory.getRules().find(r => r.id === p.id)) {
+        memory.addRule(p);
+        changes.push({ type: "temporal-pattern", pattern: p.pattern, reason: p.reason });
+      }
+    }
+
+    // ── 9. Proposal follow-up validation ─────────────────────────────────────
+    const validationChanges = validateProposalOutcomes(memory, briefing);
+    changes.push(...validationChanges);
+
     // ── Record all changes ─────────────────────────────────────────────────────
     for (const c of changes) this._record(c);
     return changes;
@@ -2576,6 +2903,12 @@ class JarvisSelfImprover {
             section += `- **Warning** \`${r.action}\` is unreliable: ${r.reason} (${pct}%)\n`;
           } else if (r.type === "workflow-preference") {
             section += `- **Workflow** \`${r.projectId}\` → prefer \`${r.preferred}\`: ${r.reason}\n`;
+          } else if (r.type === "priority-boost") {
+            section += `- **Boost** \`${r.insightType}\` insights: ${r.reason} (+${r.boost})\n`;
+          } else if (r.type === "severity-calibration") {
+            section += `- **Calibrate** \`${r.insightType}\` ${r.fromSeverity}\u2192${r.toSeverity}: ${r.reason}\n`;
+          } else if (r.type === "temporal-pattern") {
+            section += `- **Pattern** ${r.reason} (${pct}%)\n`;
           }
         }
         section += "\n";
@@ -2748,9 +3081,10 @@ class Jarvis {
           ];
 
           // Adapt → filter → priority-score → enrich → sort
-          const allInsights = adaptInsightsForContext(rawInsights, projectContext, personality)
+          const memRules = this._memory.getRules();
+          const allInsights = adaptInsightsForContext(rawInsights, projectContext, personality, memRules)
             .filter(i => !this._dismissed.has(i.id) && !shouldSuppress(i.id, this._memory))
-            .map(i => scoreInsight(i, personality))
+            .map(i => scoreInsight(i, personality, memRules))
             .map(i => enrichInsight(i))
             .sort((a, b) => b.priority - a.priority);
 
@@ -2876,6 +3210,22 @@ class Jarvis {
       // Trend detection — compare against historical snapshots
       try { briefing.trends = detectTrends(briefing, this._memory); } catch {}
 
+      // Temporal pattern trends — surface day-of-week and cyclic patterns
+      try {
+        const now = new Date();
+        const temporalRules = this._memory.getRules().filter(r => r.type === "temporal-pattern");
+        for (const rule of temporalRules) {
+          if (rule.dayOfWeek != null && rule.dayOfWeek === now.getDay()) {
+            briefing.trends.push({ id: rule.id, type: "trend", severity: "info",
+              title: rule.reason, detail: "Based on historical patterns" });
+          }
+          if (rule.pattern === "cyclic-issues") {
+            briefing.trends.push({ id: rule.id, type: "trend", severity: "info",
+              title: rule.reason, detail: "These issues keep appearing and disappearing" });
+          }
+        }
+      } catch {}
+
       // Proposal generation — surface capability gaps and actionable requests
       try {
         briefing.proposals = generateProposals(this._projects, this._memory, this.getCapabilities());
@@ -2888,6 +3238,10 @@ class Jarvis {
           briefing.learnings = reflect(this._memory);
         }
       } catch {}
+
+      // Proactive nudges — gentle suggestions based on validated observations
+      briefing.nudges = [];
+      try { briefing.nudges = generateProactiveNudges(this._projects, this._improver._sessionIntel, this._memory); } catch {}
 
       // Record snapshot for future trend analysis
       try { this._memory.recordSnapshot(briefing); } catch {}
@@ -2914,7 +3268,15 @@ class Jarvis {
   dismiss(insightId) {
     this._dismissed.add(insightId);
     setTimeout(() => this._dismissed.delete(insightId), 24 * 60 * 60 * 1000);
-    this._memory.recordDismissal(insightId);
+    // Enrich dismissal with severity/type from cached briefing
+    const briefing = this.getCachedBriefing();
+    let severity = null, type = null;
+    if (briefing) {
+      const all = [...(briefing.sessions || []).flatMap(s => s.insights || []), ...(briefing.globalInsights || [])];
+      const match = all.find(i => i.id === insightId);
+      if (match) { severity = match.severity; type = match.type; }
+    }
+    this._memory.recordDismissal(insightId, severity, type);
     this.invalidateCache();
   }
 
@@ -2965,6 +3327,17 @@ class Jarvis {
 
       // Check if this action has a learned unreliability warning
       const unreliableRule = memory.getRules().find(r => r.type === "unreliable-action" && r.action === action);
+
+      // Record engagement — positive reinforcement when user acts on an insight
+      const cachedBriefing = this.getCachedBriefing();
+      if (cachedBriefing) {
+        const matchingInsight = (cachedBriefing.sessions || [])
+          .flatMap(s => s.insights || [])
+          .find(i => i.action === action);
+        if (matchingInsight) {
+          this._memory.recordEngagement(matchingInsight.id, matchingInsight.type, matchingInsight.severity);
+        }
+      }
 
       try {
         // Risk assessment gate — block high-risk actions unless confirmed
@@ -3035,6 +3408,7 @@ class Jarvis {
         snapshots: this._memory.getSnapshots().length,
         dismissals: this._memory.getDismissals().length,
         actions: this._memory.getActions().length,
+        engagements: this._memory.getEngagements().length,
       }});
     });
 
@@ -3087,7 +3461,9 @@ class Jarvis {
       const executor = this._proposalExecutors?.[proposal.proposalType];
       if (!executor) {
         // Advisory-only — no executor registered
-        this._memory.recordProposalApproval(proposalId, "advisory");
+        const relatedInsights1 = (this.getCachedBriefing()?.sessions || [])
+          .flatMap(s => s.insights || []).map(i => i.id);
+        this._memory.recordProposalApproval(proposalId, "advisory", relatedInsights1);
         this.invalidateCache();
         return res.json({ ok: true, advisory: true, message: `Noted \u2014 "${proposal.title}" is advisory. Implement it manually.`,
           proposal: { title: proposal.title, detail: proposal.detail, payload: proposal.payload } });
@@ -3101,11 +3477,15 @@ class Jarvis {
 
       try {
         const result = await executor({ proposal, confirmed });
-        this._memory.recordProposalApproval(proposalId, "executed");
+        const relatedInsights2 = (this.getCachedBriefing()?.sessions || [])
+          .flatMap(s => s.insights || []).map(i => i.id);
+        this._memory.recordProposalApproval(proposalId, "executed", relatedInsights2);
         this.invalidateCache();
         return res.json({ ok: true, ...result });
       } catch (err) {
-        this._memory.recordProposalApproval(proposalId, "error");
+        const relatedInsightsErr = (this.getCachedBriefing()?.sessions || [])
+          .flatMap(s => s.insights || []).map(i => i.id);
+        this._memory.recordProposalApproval(proposalId, "error", relatedInsightsErr);
         return res.status(500).json({ error: err.message });
       }
     });

@@ -1094,6 +1094,42 @@
                     </div>
                   )}
 
+                  {briefing.nudges?.length > 0 && (
+                    <div style={{ display:"flex", flexDirection:"column", gap:4 }}>
+                      <div style={{ fontSize:10, fontWeight:700, color:"var(--txt4)", textTransform:"uppercase", letterSpacing:.5, fontStyle:"italic" }}>
+                        {"\uD83D\uDCA1"} Jarvis Suggests
+                      </div>
+                      {briefing.nudges.slice(0, 2).map(n => (
+                        <div key={n.id} style={{
+                          display:"flex", alignItems:"flex-start", gap:8,
+                          padding: isDesktop ? "6px 8px" : "8px 10px", borderRadius:8,
+                          background:"color-mix(in srgb, var(--acc) 4%, var(--glass2))",
+                          border:"1px solid color-mix(in srgb, var(--acc) 10%, transparent)",
+                          backdropFilter:"blur(8px)", WebkitBackdropFilter:"blur(8px)",
+                          fontSize: isDesktop ? 11 : 12, fontStyle:"italic", color:"var(--txt3)",
+                          animation:"jarvisFadeIn .25s ease",
+                          minWidth:0, overflow:"hidden",
+                        }}>
+                          <div style={{ flex:1, minWidth:0, overflow:"hidden" }}>
+                            <div style={{ fontWeight:600, fontStyle:"normal", color:"var(--txt2)",
+                              overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{n.title}</div>
+                            {n.detail && <div style={{ marginTop:2, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{n.detail}</div>}
+                          </div>
+                          {n.action && onAction && (
+                            <button onClick={() => onAction(null, n.action, false)} style={{
+                              flexShrink:0, padding: isDesktop ? "2px 6px" : "4px 10px",
+                              fontSize: isDesktop ? 10 : 11, fontWeight:600,
+                              background:"color-mix(in srgb, var(--acc) 12%, transparent)",
+                              border:"1px solid color-mix(in srgb, var(--acc) 20%, transparent)",
+                              borderRadius:6, color:"var(--acc)", cursor:"pointer",
+                              minHeight: isDesktop ? "auto" : 28,
+                            }}>{n.action}</button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
                   {briefing.trends?.length > 0 && (
                     <div style={{ display:"flex", flexDirection:"column", gap:3 }}>
                       <div style={{ fontSize:10, fontWeight:700, color:"var(--txt4)", textTransform:"uppercase", letterSpacing:.5 }}>
@@ -2030,6 +2066,53 @@
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                   {briefing.proposals.map(p => <ProposalCard key={p.id} proposal={p} onRespond={onRespondToProposal}/>)}
+                </div>
+              </div>
+            )}
+
+            {/* Jarvis Suggests — proactive nudges based on validated observations */}
+            {!selectedSession && briefing.nudges?.length > 0 && filterCategory === "all" && (
+              <div style={{ marginBottom: 24 }}>
+                <div style={{
+                  display: "flex", alignItems: "center", gap: 8, marginBottom: 10,
+                  paddingBottom: 6, borderBottom: "1px solid var(--glass-border)",
+                }}>
+                  <span style={{ fontSize: 16 }}>{"\uD83D\uDCA1"}</span>
+                  <span style={{ fontSize: 14, fontWeight: 700, color: "var(--txt3)", fontStyle: "italic" }}>Jarvis Suggests</span>
+                  <span style={{ fontSize: 11, color: "var(--txt4)" }}>({briefing.nudges.length})</span>
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {briefing.nudges.map(n => (
+                    <div key={n.id} style={{
+                      display: "flex", alignItems: "flex-start", gap: 10,
+                      padding: "10px 12px", borderRadius: 10,
+                      background: "color-mix(in srgb, var(--acc) 4%, var(--glass2))",
+                      border: "1px solid color-mix(in srgb, var(--acc) 10%, transparent)",
+                      backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)",
+                      boxShadow: "var(--glass-shd)",
+                      animation: "jarvisFadeIn .25s ease",
+                      minWidth: 0, overflow: "hidden",
+                    }}>
+                      <div style={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: "var(--txt2)",
+                          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{n.title}</div>
+                        {n.detail && <div style={{ fontSize: 12, color: "var(--txt3)", fontStyle: "italic", marginTop: 3,
+                          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{n.detail}</div>}
+                        {n.observationSource && <div style={{ fontSize: 10, color: "var(--txt4)", marginTop: 4 }}>
+                          Based on observed pattern: {n.observationSource}
+                        </div>}
+                      </div>
+                      {n.action && onAction && (
+                        <button onClick={() => onAction(null, n.action, false)} style={{
+                          flexShrink: 0, padding: "4px 12px",
+                          fontSize: 11, fontWeight: 600,
+                          background: "color-mix(in srgb, var(--acc) 12%, transparent)",
+                          border: "1px solid color-mix(in srgb, var(--acc) 20%, transparent)",
+                          borderRadius: 8, color: "var(--acc)", cursor: "pointer",
+                        }}>{n.action}</button>
+                      )}
+                    </div>
+                  ))}
                 </div>
               </div>
             )}
