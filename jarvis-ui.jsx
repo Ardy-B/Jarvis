@@ -62,6 +62,7 @@
         fontSize:12, animation:"jarvisFadeIn .25s ease" }}>
         <span style={{ fontSize:14, flexShrink:0 }}>{iconMap[insight.type] || "\u2139"}</span>
         <div style={{ flex:1, minWidth:0 }}>
+          {insight.sessionName && <div style={{ fontSize:9, fontWeight:700, color:"var(--acc)", textTransform:"uppercase", letterSpacing:0.5, marginBottom:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{insight.sessionName}</div>}
           <div style={{ fontWeight:600, color: sevColor[insight.severity] || sevColor.info }}>{insight.title}</div>
           {actionResult ? (
             <div style={{ color:"var(--grn)", fontSize:11, marginTop:1 }}>{actionResult}</div>
@@ -133,6 +134,7 @@
         fontSize:12, animation:"jarvisFadeIn .25s ease" }}>
         <span style={{ fontSize:14, flexShrink:0, marginTop:1 }}>{typeIcons[proposal.proposalType] || "\uD83D\uDCA1"}</span>
         <div style={{ flex:1, minWidth:0 }}>
+          {proposal.projectName && <div style={{ fontSize:9, fontWeight:700, color:"var(--txt4)", textTransform:"uppercase", letterSpacing:0.5, marginBottom:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{proposal.projectName}</div>}
           <div style={{ fontWeight:600, color:"var(--acc)", fontSize:12 }}>{proposal.title}</div>
           {result ? (
             <div style={{ color:"var(--grn)", fontSize:11, marginTop:1 }}>{"\u2713"} {result}</div>
@@ -1115,8 +1117,8 @@
                               overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{n.title}</div>
                             {n.detail && <div style={{ marginTop:2, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{n.detail}</div>}
                           </div>
-                          {n.action && onAction && (
-                            <button onClick={() => onAction(null, n.action, false)} style={{
+                          {n.action && n.sessionId && onAction && (
+                            <button onClick={() => onAction(n.sessionId, n.action, false)} style={{
                               flexShrink:0, padding: isDesktop ? "2px 6px" : "4px 10px",
                               fontSize: isDesktop ? 10 : 11, fontWeight:600,
                               background:"color-mix(in srgb, var(--acc) 12%, transparent)",
@@ -1470,6 +1472,12 @@
                 color: sevColor[insight.severity] || sevColor.info,
               }}>{sevLabel[insight.severity] || "Info"}</span>
               <span style={{ fontSize: 9, color: "var(--txt4)", textTransform: "uppercase", letterSpacing: 0.5 }}>{insight.type}</span>
+              {insight.sessionName && <span style={{
+                fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5,
+                padding: "1px 6px", borderRadius: 4,
+                background: "color-mix(in srgb, var(--acc) 13%, transparent)",
+                color: "var(--acc)",
+              }}>{insight.sessionName}</span>}
             </div>
             <div style={{ fontWeight: 600, color: "var(--txt)", fontSize: 13, marginTop: 3, lineHeight: 1.3 }}>{insight.title}</div>
             {insight.detail && !expanded && (
@@ -2102,8 +2110,8 @@
                           Based on observed pattern: {n.observationSource}
                         </div>}
                       </div>
-                      {n.action && onAction && (
-                        <button onClick={() => onAction(null, n.action, false)} style={{
+                      {n.action && n.sessionId && onAction && (
+                        <button onClick={() => onAction(n.sessionId, n.action, false)} style={{
                           flexShrink: 0, padding: "4px 12px",
                           fontSize: 11, fontWeight: 600,
                           background: "color-mix(in srgb, var(--acc) 12%, transparent)",

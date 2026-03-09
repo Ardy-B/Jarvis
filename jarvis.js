@@ -1495,7 +1495,7 @@ function generateProactiveNudges(projects, sessionIntel, memory) {
         const hasRecentTest = recentEntries.some(e => /npm\s+test|jest|pytest|vitest|mocha/i.test(e.toolUse?.input?.command || ""));
         const hasRecentCommit = recentEntries.some(e => /git\s+commit/i.test(e.toolUse?.input?.command || ""));
         if (hasRecentEdit && !hasRecentTest && !hasRecentCommit)
-          nudges.push({ id: `nudge-test-${project.id}`, title: "Run tests before committing?",
+          nudges.push({ id: `nudge-test-${project.id}`, sessionId: project.id, title: "Run tests before committing?",
             detail: `You usually test before commits in ${project.name}`, action: null, confidence: 0.7, observationSource: "testBeforeCommit" });
       } catch {}
     }
@@ -1509,7 +1509,7 @@ function generateProactiveNudges(projects, sessionIntel, memory) {
           if (/git\s+commit/i.test(output[i].toolUse?.input?.command || "")) break;
         }
         if (editsSinceLastCommit >= 8)
-          nudges.push({ id: `nudge-commit-${project.id}`, title: "Time to commit?",
+          nudges.push({ id: `nudge-commit-${project.id}`, sessionId: project.id, title: "Time to commit?",
             detail: `${editsSinceLastCommit} edits since last commit — consider saving a checkpoint`,
             action: "commit", confidence: 0.6, observationSource: "commitCadence" });
       } catch {}
@@ -1544,6 +1544,12 @@ function generateProposals(projects, memory, capabilities) {
   for (const p of proposals) {
     const effRule = effectivenessRules.find(r => p.proposalType === r.proposalType);
     if (effRule && effRule.confidence < 0.3) p.confidence *= 0.5;
+  }
+
+  // Enrich proposals with projectName for UI display
+  const projectMap = new Map(projects.map(p => [p.id, p.name]));
+  for (const p of proposals) {
+    if (p.projectId && projectMap.has(p.projectId)) p.projectName = projectMap.get(p.projectId);
   }
 
   // Filter excluded, sort by confidence descending, cap at 5
@@ -2800,7 +2806,7 @@ class JarvisSelfImprover {
         const rawProject = rawProjects.find(p => p.id === session.id);
         if (!rawProject?.output?.length) continue;
 
-        const project = { id: session.id, output: rawProject.output, folder: rawProject.folder || session.context?.folder };
+        const project = { id: session.id, output: rawProject.output, folder: rawProject.folder || session.context?.folder, name: rawProject.name || session.name, sessionType: rawProject.sessionType };
         const signals = intel.analyze(project);
         if (!signals) continue;
         allSignals.set(session.id, signals);
