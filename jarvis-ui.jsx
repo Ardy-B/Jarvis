@@ -141,6 +141,12 @@
           ) : (
             <>
               {proposal.detail && <div style={{ color:"var(--txt3)", fontSize:11, marginTop:1 }}>{proposal.detail}</div>}
+              {proposal.reason && (
+                <div style={{ fontSize:10, color:"var(--txt4)", marginTop:3, fontStyle:"italic", paddingLeft:6,
+                  borderLeft:"2px solid color-mix(in srgb, var(--acc) 25%, transparent)" }}>
+                  Rationale: {proposal.reason}
+                </div>
+              )}
               {proposal.evidence?.length > 0 && (
                 <div style={{ display:"flex", gap:4, flexWrap:"wrap", marginTop:3 }}>
                   {proposal.evidence.map((e, i) => (
@@ -150,8 +156,13 @@
                 </div>
               )}
               {proposal.confidence != null && (
-                <div style={{ fontSize:9, color:"var(--txt4)", marginTop:2 }}>
-                  Confidence: {Math.round(proposal.confidence * 100)}%
+                <div style={{ display:"flex", alignItems:"center", gap:6, fontSize:9, color:"var(--txt4)", marginTop:2 }}>
+                  <span>Confidence: {Math.round(proposal.confidence * 100)}%</span>
+                  {proposal.expiresAt && (proposal.expiresAt - Date.now()) < 3 * 24 * 60 * 60 * 1000 && (
+                    <span style={{ color:"var(--amb)", fontWeight:600 }}>
+                      Expires in {Math.max(1, Math.ceil((proposal.expiresAt - Date.now()) / (24 * 60 * 60 * 1000)))}d
+                    </span>
+                  )}
                 </div>
               )}
             </>
@@ -160,19 +171,21 @@
         {!result && !pendingConfirm && (
           <div style={{ display:"flex", gap:3, flexShrink:0, marginTop:1 }}>
             <button onClick={() => handleRespond("approve")} disabled={loading}
+              title="JARVIS will execute this action"
               style={{ background:"color-mix(in srgb, var(--grn) 12%, transparent)", border:"1px solid var(--grn)", color:"var(--grn)",
                 cursor: loading ? "wait" : "pointer", padding:"2px 7px", fontSize:10, fontWeight:600, borderRadius:5,
                 opacity: loading ? 0.5 : 1, boxShadow:"var(--glass-edge)", transition:"all .15s var(--transition-smooth)" }}>
               {loading ? "..." : "Approve"}
             </button>
             <button onClick={() => handleRespond("defer")} disabled={loading}
+              title="Deferred — will appear again next briefing"
               style={{ background:"transparent", border:"1px solid var(--glass-border)", color:"var(--txt4)",
                 cursor:"pointer", padding:"2px 7px", fontSize:10, fontWeight:600, borderRadius:5 }}>
               Later
             </button>
             <button onClick={() => handleRespond("reject")}
               style={{ background:"transparent", border:"none", color:"var(--txt4)",
-                cursor:"pointer", padding:2, fontSize:14, lineHeight:1 }} title="Dismiss">{"\u00D7"}</button>
+                cursor:"pointer", padding:2, fontSize:14, lineHeight:1 }} title="Permanently dismissed — will not appear again">{"\u00D7"}</button>
           </div>
         )}
         {pendingConfirm && (
@@ -1748,6 +1761,11 @@
                         {s.git?.branch && <span style={{ marginRight: 6 }}>{"\u2325"} {s.git.branch}</span>}
                         {s.status === "busy" ? <span style={{ color: "var(--grn)" }}>{"\u25CF"} Running</span> : null}
                       </div>
+                      {s.lastActivityAt && (
+                        <div style={{ fontSize: 9, color: "var(--txt4)", marginTop: 1, opacity: 0.7 }}>
+                          {formatTimeAgoClient(s.lastActivityAt)}
+                        </div>
+                      )}
                     </div>
                     <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
                       {sessErrors > 0 && <span style={{ fontSize: 10, fontWeight: 700, color: "var(--red)", background: "var(--redBg)", padding: "1px 5px", borderRadius: 4 }}>{sessErrors}</span>}
@@ -1803,6 +1821,52 @@
                   {selectedSession.workflow && (
                     <div style={{ fontSize: 10, color: "var(--txt4)", marginTop: 4 }}>Workflow: {selectedSession.workflow}</div>
                   )}
+                  {/* Last activity + last user message */}
+                  {selectedSession.lastActivityAt && (
+                    <div style={{ fontSize: 10, color: "var(--txt4)", marginTop: 4 }}>
+                      Active {formatTimeAgoClient(selectedSession.lastActivityAt)}
+                      {selectedSession.lastUserMessage && (
+                        <span style={{ marginLeft: 6, opacity: 0.7 }}>
+                          — "{selectedSession.lastUserMessage.length > 50 ? selectedSession.lastUserMessage.slice(0, 50) + "..." : selectedSession.lastUserMessage}"
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  {/* Personality traits */}
+                  {selectedSession.context?.personality?.length > 0 && (
+                    <div style={{ display: "flex", gap: 4, marginTop: 6, flexWrap: "wrap" }}>
+                      {selectedSession.context.personality.map((trait, i) => (
+                        <span key={i} style={{ fontSize: 9, padding: "2px 6px", borderRadius: 4,
+                          background: "color-mix(in srgb, var(--acc) 10%, var(--glass2))",
+                          color: "var(--acc)", fontWeight: 600, border: "1px solid color-mix(in srgb, var(--acc) 15%, transparent)" }}>{trait}</span>
+                      ))}
+                    </div>
+                  )}
+                  {/* Commit/author metadata */}
+                  {(selectedSession.context?.daysSinceCommit != null || selectedSession.context?.authorCount != null) && (
+                    <div style={{ display: "flex", gap: 8, marginTop: 4, fontSize: 9, color: "var(--txt4)" }}>
+                      {selectedSession.context.daysSinceCommit != null && (
+                        <span style={{ color: selectedSession.context.daysSinceCommit > 7 ? "var(--amb)" : "var(--txt4)" }}>
+                          {selectedSession.context.daysSinceCommit === 0 ? "Committed today" : selectedSession.context.daysSinceCommit + "d since last commit"}
+                        </span>
+                      )}
+                      {selectedSession.context.authorCount != null && (
+                        <span>{selectedSession.context.authorCount} author{selectedSession.context.authorCount !== 1 ? "s" : ""}</span>
+                      )}
+                    </div>
+                  )}
+                  {/* Recommended agents */}
+                  {selectedSession.recommendedAgents?.length > 0 && (
+                    <div style={{ display: "flex", gap: 4, marginTop: 6, flexWrap: "wrap" }}>
+                      {selectedSession.recommendedAgents.map((agent, i) => (
+                        <span key={i} style={{ fontSize: 9, padding: "2px 6px", borderRadius: 4,
+                          background: "color-mix(in srgb, var(--grn) 10%, var(--glass2))",
+                          color: "var(--grn)", fontWeight: 600, border: "1px solid color-mix(in srgb, var(--grn) 15%, transparent)" }}>
+                          {"\u2699"} {agent}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                 </div>
                 <div style={{ textAlign: "center", flexShrink: 0 }}>
                   <div style={{ fontSize: 11, color: "var(--txt4)", marginBottom: 2 }}>Insights</div>
@@ -1842,6 +1906,84 @@
                   </div>
                 </div>
               </div>
+            )}
+
+            {/* ── Trends, Signal Quality, Learnings — overview only ── */}
+            {!selectedSession && (
+              <>
+                {/* Trends cards */}
+                {briefing.trends?.length > 0 && (
+                  <div style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap" }}>
+                    {briefing.trends.map((t, i) => {
+                      const isUp = /up|increas|ris/i.test(t.direction || t.title || "");
+                      const isDown = /down|decreas|resolv|fix/i.test(t.direction || t.title || "");
+                      const icon = isUp ? "\u2191" : isDown ? "\u2193" : "\u2192";
+                      const color = (t.severity === "warning" || t.severity === "error" || isUp && /error|fail|crash/i.test(t.title || ""))
+                        ? "var(--amb)" : isDown ? "var(--grn)" : "var(--txt3)";
+                      const bg = color === "var(--amb)" ? "var(--ambBg)" : color === "var(--grn)" ? "color-mix(in srgb, var(--grn) 8%, var(--glass2))" : "var(--glass2)";
+                      return (
+                        <div key={i} style={{ flex: "1 1 200px", padding: "10px 12px", borderRadius: 10,
+                          background: bg, border: "1px solid color-mix(in srgb, " + color + " 15%, transparent)",
+                          backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", animation: "jarvisFadeIn .25s ease" }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            <span style={{ fontSize: 14, color, fontWeight: 700 }}>{icon}</span>
+                            <span style={{ fontSize: 11, fontWeight: 600, color }}>{t.title}</span>
+                          </div>
+                          {t.detail && <div style={{ fontSize: 10, color: "var(--txt4)", marginTop: 3 }}>{t.detail}</div>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Signal Quality meter */}
+                {briefing.signalQuality != null && (
+                  <div style={{ marginBottom: 16, padding: "10px 14px", borderRadius: 10,
+                    background: "var(--glass)", border: "1px solid var(--glass-border)",
+                    backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)" }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                      <span style={{ fontSize: 11, fontWeight: 600, color: "var(--txt3)" }}>Signal Quality</span>
+                      <span style={{ fontSize: 10, color: briefing.signalQuality >= 60 ? "var(--grn)" : briefing.signalQuality >= 30 ? "var(--amb)" : "var(--red)", fontWeight: 600 }}>
+                        {briefing.signalQuality}%
+                        {briefing.signalQuality >= 60 ? " — Insights acted on effectively" : briefing.signalQuality >= 30 ? " — Moderate noise" : " — May be too noisy"}
+                      </span>
+                    </div>
+                    <div style={{ height: 6, borderRadius: 3, background: "var(--glass3)", overflow: "hidden" }}>
+                      <div style={{
+                        height: "100%", borderRadius: 3, transition: "width .4s ease",
+                        width: Math.min(100, Math.max(0, briefing.signalQuality)) + "%",
+                        background: briefing.signalQuality >= 60 ? "var(--grn)" : briefing.signalQuality >= 30 ? "var(--amb)" : "var(--red)",
+                      }}/>
+                    </div>
+                  </div>
+                )}
+
+                {/* Learnings summary */}
+                {briefing.learnings?.length > 0 && (
+                  <div style={{ marginBottom: 16, padding: "10px 14px", borderRadius: 10,
+                    background: "var(--glass)", border: "1px solid var(--glass-border)",
+                    backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)" }}>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: "var(--txt3)", marginBottom: 6 }}>
+                      Learnings ({briefing.learnings.length})
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      {briefing.learnings.map((rule, i) => (
+                        <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10 }}>
+                          <span style={{ fontSize: 9, padding: "1px 5px", borderRadius: 3, flexShrink: 0, fontWeight: 600,
+                            background: rule.type === "Suppressed" ? "var(--ambBg)" : rule.type === "Unreliable" ? "var(--redBg)" : "var(--glass2)",
+                            color: rule.type === "Suppressed" ? "var(--amb)" : rule.type === "Unreliable" ? "var(--red)" : "var(--txt4)",
+                            border: "1px solid " + (rule.type === "Suppressed" ? "color-mix(in srgb, var(--amb) 20%, transparent)" : rule.type === "Unreliable" ? "color-mix(in srgb, var(--red) 20%, transparent)" : "var(--glass-border)"),
+                          }}>{rule.type || "Rule"}</span>
+                          <span style={{ flex: 1, color: "var(--txt3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{rule.reason || rule.description || rule.rule}</span>
+                          {rule.confidence != null && (
+                            <span style={{ fontSize: 9, color: "var(--txt4)", flexShrink: 0 }}>{Math.round(rule.confidence * 100)}%</span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
             )}
 
             {/* Category filter bar */}
