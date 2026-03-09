@@ -960,7 +960,8 @@ async function assessActionRisk(project, action) {
 class JarvisMemory {
   constructor(memoryPath) {
     this._path = memoryPath;
-    this._data = { snapshots: [], dismissals: [], actions: [], rules: [], version: 1 };
+    this._data = { snapshots: [], dismissals: [], actions: [], rules: [], version: 1,
+      proposals: { approved: [], rejected: [], deferred: [] } };
     this._maxSnapshots = 50;
     this._maxDismissals = 200;
     this._maxActions = 200;
@@ -1099,6 +1100,54 @@ class JarvisMemory {
   getSnapshots() { return this._data.snapshots || []; }
   getDismissals() { return this._data.dismissals || []; }
   getActions() { return this._data.actions || []; }
+
+  // Proposal memory — tracks approved/rejected/deferred proposals
+  _ensureProposals() {
+    if (!this._data.proposals) this._data.proposals = { approved: [], rejected: [], deferred: [] };
+  }
+
+  recordProposalApproval(proposalId, outcome) {
+    this._ensureProposals();
+    this._data.proposals.approved.push({ id: proposalId, outcome, ts: Date.now() });
+    if (this._data.proposals.approved.length > 100) {
+      this._data.proposals.approved = this._data.proposals.approved.slice(-100);
+    }
+    this._save();
+  }
+
+  recordProposalRejection(proposalId) {
+    this._ensureProposals();
+    this._data.proposals.rejected.push({ id: proposalId, ts: Date.now() });
+    if (this._data.proposals.rejected.length > 100) {
+      this._data.proposals.rejected = this._data.proposals.rejected.slice(-100);
+    }
+    this._save();
+  }
+
+  recordProposalDeferral(proposalId, deferDays = 7) {
+    this._ensureProposals();
+    this._data.proposals.deferred.push({ id: proposalId, ts: Date.now(), deferUntil: Date.now() + deferDays * 24 * 60 * 60 * 1000 });
+    if (this._data.proposals.deferred.length > 100) {
+      this._data.proposals.deferred = this._data.proposals.deferred.slice(-100);
+    }
+    this._save();
+  }
+
+  getRejectedProposals() {
+    this._ensureProposals();
+    return new Set(this._data.proposals.rejected.map(p => p.id));
+  }
+
+  getDeferredProposals() {
+    this._ensureProposals();
+    const now = Date.now();
+    return new Set(this._data.proposals.deferred.filter(p => p.deferUntil > now).map(p => p.id));
+  }
+
+  getApprovedProposals() {
+    this._ensureProposals();
+    return this._data.proposals.approved;
+  }
 }
 
 // ── Trend Detection ──────────────────────────────────────────────────────────
@@ -1236,6 +1285,224 @@ function shouldSuppress(insightId, memory) {
   const rules = memory.getRules().filter(r => r.type === "auto-suppress");
   const pattern = insightId.replace(/-[^-]+$/, "");
   return rules.some(r => r.pattern === pattern);
+}
+
+// ── Proposal Generation ──────────────────────────────────────────────────────
+// Analyzes capability gaps and surfaces actionable requests that the user can
+// approve, dismiss, or defer. Proposals represent things JARVIS cannot do on
+// its own and needs the host to execute.
+
+function generateProposals(projects, memory, capabilities) {
+  // Guard: only generate after ≥3 briefing cycles to prevent spam on fresh installs
+  if (memory.getSnapshots().length < 3) return [];
+
+  const rejected = memory.getRejectedProposals();
+  const deferred = memory.getDeferredProposals();
+  const excluded = new Set([...rejected, ...deferred]);
+
+  const proposals = [
+    ...detectMissingToolProposals(projects, excluded),
+    ...detectClaudeMdGaps(projects, excluded),
+    ...detectDismissalPatternProposals(memory, excluded),
+    ...detectCapabilityGapProposals(projects, capabilities, excluded),
+    ...detectMcpOpportunities(projects, excluded),
+  ];
+
+  // Filter excluded, sort by confidence descending, cap at 5
+  return proposals
+    .filter(p => !excluded.has(p.id))
+    .sort((a, b) => b.confidence - a.confidence)
+    .slice(0, 5);
+}
+
+function detectMissingToolProposals(projects, excluded) {
+  const proposals = [];
+  for (const p of projects) {
+    if (!p.folder) continue;
+    try {
+      const pkgPath = path.join(p.folder, "package.json");
+      if (!fs.existsSync(pkgPath)) continue;
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+      const allDeps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+
+      // .ts files exist but no typescript in deps
+      const id1 = `proposal-npm-install-typescript-${p.id}`;
+      if (!excluded.has(id1) && !allDeps["typescript"]) {
+        try {
+          const tsFiles = fs.readdirSync(p.folder, { recursive: true }).filter(f => typeof f === "string" && f.endsWith(".ts") && !f.includes("node_modules"));
+          if (tsFiles.length > 0) {
+            proposals.push({
+              id: id1, proposalType: "npm-install",
+              title: "Install TypeScript for type checking",
+              detail: `Detected ${tsFiles.length} .ts file${tsFiles.length > 1 ? "s" : ""} but TypeScript is not installed`,
+              reason: "Would enable type-error detection in health insights",
+              severity: "info", confidence: Math.min(0.6 + 0.04 * tsFiles.length, 1),
+              payload: { package: "typescript", flags: "-D" },
+              evidence: [`Found ${tsFiles.length} .ts files`, "No typescript in package.json"],
+              projectId: p.id, createdAt: Date.now(), expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+            });
+          }
+        } catch {}
+      }
+
+      // eslint config exists but not installed
+      const id2 = `proposal-npm-install-eslint-${p.id}`;
+      if (!excluded.has(id2) && !allDeps["eslint"]) {
+        const eslintConfigs = [".eslintrc", ".eslintrc.js", ".eslintrc.json", ".eslintrc.yml", "eslint.config.js", "eslint.config.mjs"];
+        const hasEslintConfig = eslintConfigs.some(c => fs.existsSync(path.join(p.folder, c)));
+        if (hasEslintConfig) {
+          proposals.push({
+            id: id2, proposalType: "npm-install",
+            title: "Install ESLint",
+            detail: "ESLint config exists but eslint is not installed",
+            reason: "Enables linting insights and code quality checks",
+            severity: "info", confidence: 0.8,
+            payload: { package: "eslint", flags: "-D" },
+            evidence: ["ESLint config file found", "No eslint in package.json"],
+            projectId: p.id, createdAt: Date.now(), expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+          });
+        }
+      }
+
+      // Test files exist but no test runner
+      const id3 = `proposal-npm-install-test-runner-${p.id}`;
+      const hasTestRunner = !!(allDeps["jest"] || allDeps["vitest"] || allDeps["mocha"] || allDeps["cypress"] || allDeps["playwright"]);
+      if (!excluded.has(id3) && !hasTestRunner) {
+        try {
+          const testFiles = fs.readdirSync(p.folder, { recursive: true }).filter(f =>
+            typeof f === "string" && !f.includes("node_modules") &&
+            (/\.test\.[jt]sx?$/.test(f) || /\.spec\.[jt]sx?$/.test(f) || /^__tests__\//.test(f))
+          );
+          if (testFiles.length > 0) {
+            proposals.push({
+              id: id3, proposalType: "npm-install",
+              title: "Install a test runner",
+              detail: `Found ${testFiles.length} test file${testFiles.length > 1 ? "s" : ""} but no test runner installed`,
+              reason: "Would enable test execution and coverage insights",
+              severity: "info", confidence: Math.min(0.6 + 0.04 * testFiles.length, 1),
+              payload: { package: "vitest", flags: "-D" },
+              evidence: [`Found ${testFiles.length} test files`, "No test runner in package.json"],
+              projectId: p.id, createdAt: Date.now(), expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+            });
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+  return proposals;
+}
+
+function detectClaudeMdGaps(projects, excluded) {
+  const proposals = [];
+  const conventionalSections = ["Commands", "Rules", "Gotchas", "Code Style", "Architecture"];
+  for (const p of projects) {
+    if (!p.folder) continue;
+    const id = `proposal-claude-md-gaps-${p.id}`;
+    if (excluded.has(id)) continue;
+    try {
+      const claudeMd = path.join(p.folder, "CLAUDE.md");
+      if (!fs.existsSync(claudeMd)) continue;
+      const content = fs.readFileSync(claudeMd, "utf8").slice(0, 5000);
+      const missingSections = conventionalSections.filter(s => !content.includes(`## ${s}`) && !content.includes(`# ${s}`));
+      if (missingSections.length > 0) {
+        proposals.push({
+          id, proposalType: "claude-md-update",
+          title: `CLAUDE.md missing ${missingSections.length} conventional section${missingSections.length > 1 ? "s" : ""}`,
+          detail: `Missing: ${missingSections.join(", ")}`,
+          reason: "Complete CLAUDE.md helps Claude understand the project better",
+          severity: "info", confidence: Math.min(0.5 + 0.1 * missingSections.length, 1),
+          payload: { sections: missingSections },
+          evidence: missingSections.map(s => `No "## ${s}" section found`),
+          projectId: p.id, createdAt: Date.now(), expiresAt: Date.now() + 14 * 24 * 60 * 60 * 1000,
+        });
+      }
+    } catch {}
+  }
+  return proposals;
+}
+
+function detectDismissalPatternProposals(memory, excluded) {
+  const proposals = [];
+  const dismissals = memory.getDismissals();
+  if (dismissals.length < 5) return proposals;
+
+  const counts = {};
+  for (const d of dismissals) {
+    const pattern = d.id.replace(/-[^-]+$/, "");
+    counts[pattern] = (counts[pattern] || 0) + 1;
+  }
+
+  const rules = memory.getRules();
+  const suppressedPatterns = new Set(rules.filter(r => r.type === "auto-suppress").map(r => r.pattern));
+  for (const [pattern, count] of Object.entries(counts)) {
+    if (count >= 5 && !suppressedPatterns.has(pattern)) {
+      const id = `proposal-suppress-${pattern}`;
+      if (excluded.has(id)) continue;
+      proposals.push({
+        id, proposalType: "config-change",
+        title: `Auto-suppress "${pattern}" insights`,
+        detail: `Dismissed ${count} times \u2014 likely not useful`,
+        reason: "Reduces noise by permanently suppressing this insight pattern",
+        severity: "info", confidence: Math.min(count / 10, 1),
+        payload: { key: `suppress-${pattern}`, value: true, pattern },
+        evidence: [`Pattern "${pattern}" dismissed ${count} times`],
+        projectId: null, createdAt: Date.now(), expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
+      });
+    }
+  }
+  return proposals;
+}
+
+function detectCapabilityGapProposals(projects, capabilities, excluded) {
+  const proposals = [];
+  const existingActions = capabilities?.actions ? Object.keys(capabilities.actions) : [];
+  for (const p of projects) {
+    if (!p.folder) continue;
+    try {
+      const id1 = `proposal-new-action-docker-${p.id}`;
+      if (!excluded.has(id1) && !existingActions.includes("docker-build")) {
+        if (fs.existsSync(path.join(p.folder, "Dockerfile")) || fs.existsSync(path.join(p.folder, "docker-compose.yml"))) {
+          proposals.push({
+            id: id1, proposalType: "new-action",
+            title: "Add Docker build action",
+            detail: "Dockerfile detected \u2014 a build/restart action could be useful",
+            reason: "Would allow Jarvis to trigger container rebuilds",
+            severity: "info", confidence: 0.5,
+            payload: { action: "docker-build", description: "Build and restart Docker containers" },
+            evidence: ["Dockerfile or docker-compose.yml found"],
+            projectId: p.id, createdAt: Date.now(), expiresAt: Date.now() + 14 * 24 * 60 * 60 * 1000,
+          });
+        }
+      }
+    } catch {}
+  }
+  return proposals;
+}
+
+function detectMcpOpportunities(projects, excluded) {
+  const proposals = [];
+  for (const p of projects) {
+    if (!p.folder) continue;
+    try {
+      const id1 = `proposal-mcp-database-${p.id}`;
+      if (!excluded.has(id1)) {
+        const sqlFiles = fs.readdirSync(p.folder).filter(f => f.endsWith(".sql"));
+        if (sqlFiles.length > 0) {
+          proposals.push({
+            id: id1, proposalType: "mcp-server",
+            title: "Consider a database MCP server",
+            detail: `Found ${sqlFiles.length} .sql file${sqlFiles.length > 1 ? "s" : ""} \u2014 an MCP server could provide schema introspection`,
+            reason: "Database-aware insights would catch schema drift and migration issues",
+            severity: "info", confidence: 0.4,
+            payload: { serverType: "database", files: sqlFiles.slice(0, 5) },
+            evidence: [`${sqlFiles.length} .sql files found in project root`],
+            projectId: p.id, createdAt: Date.now(), expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000,
+          });
+        }
+      }
+    } catch {}
+  }
+  return proposals;
 }
 
 // ── Workflow Engine ───────────────────────────────────────────────────────────
@@ -1967,13 +2234,18 @@ class Jarvis {
         branch:  { label: "Branch",  icon: "fork",      riskLevel: "low",    requiresConfirmation: true, requiresGit: true, description: "Create a feature branch" },
         install: { label: "Install", icon: "package",   riskLevel: "low",    requiresConfirmation: true, requiresGit: false, description: "Run npm install" },
       },
-      features: { briefing: true, memory: true, selfImprovement: true, hooks: true, agents: true, workflows: true, trends: true }
+      features: { briefing: true, memory: true, selfImprovement: true, hooks: true, agents: true, workflows: true, trends: true, proposals: true }
     };
   }
 
   registerActionExecutor(actionName, executorFn) {
     this._actionExecutors = this._actionExecutors || {};
     this._actionExecutors[actionName] = executorFn;
+  }
+
+  registerProposalExecutor(proposalType, executorFn) {
+    this._proposalExecutors = this._proposalExecutors || {};
+    this._proposalExecutors[proposalType] = executorFn;
   }
 
   async getBriefing(force = false) {
@@ -2155,11 +2427,18 @@ class Jarvis {
         globalInsights: globalInsights.filter(i => !this._dismissed.has(i.id)),
         trends: [],
         learnings: [],
+        proposals: [],
         capabilities: this.getCapabilities(),
       };
 
       // Trend detection — compare against historical snapshots
       try { briefing.trends = detectTrends(briefing, this._memory); } catch {}
+
+      // Proposal generation — surface capability gaps and actionable requests
+      try {
+        briefing.proposals = generateProposals(this._projects, this._memory, this.getCapabilities());
+        this._lastProposals = briefing.proposals;
+      } catch {}
 
       // Reflection — extract patterns from memory (skip if no new dismissals/actions)
       try {
@@ -2332,6 +2611,60 @@ class Jarvis {
         res.json({ trends: detectTrends(briefing, this._memory) });
       } catch (err) {
         res.status(500).json({ error: err.message });
+      }
+    });
+
+    // ── Proposal routes ──
+
+    app.get(`${prefix}/proposals`, ...middlewares, (req, res) => {
+      res.json({ proposals: this._lastProposals || [] });
+    });
+
+    app.post(`${prefix}/proposal/respond`, ...middlewares, async (req, res) => {
+      const { proposalId, response, confirmed } = req.body;
+      if (!proposalId || !response) return res.status(400).json({ error: "proposalId and response required" });
+      if (!["approve", "reject", "defer"].includes(response)) return res.status(400).json({ error: "response must be approve, reject, or defer" });
+
+      const proposal = (this._lastProposals || []).find(p => p.id === proposalId);
+
+      if (response === "reject") {
+        this._memory.recordProposalRejection(proposalId);
+        this.invalidateCache();
+        return res.json({ ok: true, message: "Proposal dismissed \u2014 won't appear again" });
+      }
+
+      if (response === "defer") {
+        this._memory.recordProposalDeferral(proposalId, 7);
+        this.invalidateCache();
+        return res.json({ ok: true, message: "Proposal deferred for 7 days" });
+      }
+
+      // Approve flow
+      if (!proposal) return res.status(404).json({ error: "Proposal not found in current briefing" });
+
+      const executor = this._proposalExecutors?.[proposal.proposalType];
+      if (!executor) {
+        // Advisory-only — no executor registered
+        this._memory.recordProposalApproval(proposalId, "advisory");
+        this.invalidateCache();
+        return res.json({ ok: true, advisory: true, message: `Noted \u2014 "${proposal.title}" is advisory. Implement it manually.`,
+          proposal: { title: proposal.title, detail: proposal.detail, payload: proposal.payload } });
+      }
+
+      // Require confirmation for executable proposals
+      if (!confirmed) {
+        return res.json({ ok: false, requiresConfirmation: true, riskLevel: "low",
+          reason: `Approve and execute: ${proposal.title}?\n${proposal.detail}` });
+      }
+
+      try {
+        const result = await executor({ proposal, confirmed });
+        this._memory.recordProposalApproval(proposalId, "executed");
+        this.invalidateCache();
+        return res.json({ ok: true, ...result });
+      } catch (err) {
+        this._memory.recordProposalApproval(proposalId, "error");
+        return res.status(500).json({ error: err.message });
       }
     });
 

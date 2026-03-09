@@ -100,6 +100,100 @@
     );
   }
 
+  // ── ProposalCard ───────────────────────────────────────────────────────
+
+  function ProposalCard({ proposal, onRespond }) {
+    const typeIcons = { "npm-install": "\uD83D\uDCE6", "claude-md-update": "\uD83D\uDCDD", "new-action": "\u26A1", "mcp-server": "\uD83D\uDD0C", "config-change": "\u2699" };
+    const [loading, setLoading] = useState(false);
+    const [result, setResult] = useState(null);
+    const [pendingConfirm, setPendingConfirm] = useState(null);
+
+    const handleRespond = (response, confirmed = false) => {
+      if (!onRespond) return;
+      setLoading(true);
+      onRespond(proposal.id, response, confirmed).then(r => {
+        if (r?.requiresConfirmation) {
+          setPendingConfirm({ reason: r.reason });
+          setLoading(false);
+        } else {
+          setPendingConfirm(null);
+          setResult(r?.message || (r?.error ? "Error: " + r.error : "Done"));
+          setLoading(false);
+          setTimeout(() => setResult(null), 5000);
+        }
+      }).catch(() => { setLoading(false); });
+    };
+
+    return (
+      <div style={{ display:"flex", alignItems:"flex-start", gap:8, padding:"8px 10px", borderRadius:8,
+        background:"color-mix(in srgb, var(--acc) 6%, var(--glass2))",
+        border:"1px solid color-mix(in srgb, var(--acc) 15%, transparent)",
+        backdropFilter:"blur(12px)", WebkitBackdropFilter:"blur(12px)",
+        boxShadow:"var(--glass-shd)", transition:"all .2s var(--transition-smooth)",
+        fontSize:12, animation:"jarvisFadeIn .25s ease" }}>
+        <span style={{ fontSize:14, flexShrink:0, marginTop:1 }}>{typeIcons[proposal.proposalType] || "\uD83D\uDCA1"}</span>
+        <div style={{ flex:1, minWidth:0 }}>
+          <div style={{ fontWeight:600, color:"var(--acc)", fontSize:12 }}>{proposal.title}</div>
+          {result ? (
+            <div style={{ color:"var(--grn)", fontSize:11, marginTop:1 }}>{"\u2713"} {result}</div>
+          ) : pendingConfirm ? (
+            <div style={{ color:"var(--amb)", fontSize:11, marginTop:1 }}>{"\u26A0"} {pendingConfirm.reason}</div>
+          ) : (
+            <>
+              {proposal.detail && <div style={{ color:"var(--txt3)", fontSize:11, marginTop:1 }}>{proposal.detail}</div>}
+              {proposal.evidence?.length > 0 && (
+                <div style={{ display:"flex", gap:4, flexWrap:"wrap", marginTop:3 }}>
+                  {proposal.evidence.map((e, i) => (
+                    <span key={i} style={{ fontSize:9, padding:"1px 5px", borderRadius:3,
+                      background:"var(--glass3)", color:"var(--txt4)", border:"1px solid var(--glass-border)" }}>{e}</span>
+                  ))}
+                </div>
+              )}
+              {proposal.confidence != null && (
+                <div style={{ fontSize:9, color:"var(--txt4)", marginTop:2 }}>
+                  Confidence: {Math.round(proposal.confidence * 100)}%
+                </div>
+              )}
+            </>
+          )}
+        </div>
+        {!result && !pendingConfirm && (
+          <div style={{ display:"flex", gap:3, flexShrink:0, marginTop:1 }}>
+            <button onClick={() => handleRespond("approve")} disabled={loading}
+              style={{ background:"color-mix(in srgb, var(--grn) 12%, transparent)", border:"1px solid var(--grn)", color:"var(--grn)",
+                cursor: loading ? "wait" : "pointer", padding:"2px 7px", fontSize:10, fontWeight:600, borderRadius:5,
+                opacity: loading ? 0.5 : 1, boxShadow:"var(--glass-edge)", transition:"all .15s var(--transition-smooth)" }}>
+              {loading ? "..." : "Approve"}
+            </button>
+            <button onClick={() => handleRespond("defer")} disabled={loading}
+              style={{ background:"transparent", border:"1px solid var(--glass-border)", color:"var(--txt4)",
+                cursor:"pointer", padding:"2px 7px", fontSize:10, fontWeight:600, borderRadius:5 }}>
+              Later
+            </button>
+            <button onClick={() => handleRespond("reject")}
+              style={{ background:"transparent", border:"none", color:"var(--txt4)",
+                cursor:"pointer", padding:2, fontSize:14, lineHeight:1 }} title="Dismiss">{"\u00D7"}</button>
+          </div>
+        )}
+        {pendingConfirm && (
+          <div style={{ display:"flex", gap:4, flexShrink:0, marginTop:1 }}>
+            <button onClick={() => handleRespond("approve", true)} disabled={loading}
+              style={{ background:"color-mix(in srgb, var(--grn) 12%, transparent)", border:"1px solid var(--grn)", color:"var(--grn)",
+                cursor:"pointer", padding:"2px 8px", fontSize:10, fontWeight:600, borderRadius:5,
+                boxShadow:"var(--glass-edge)", transition:"all .15s var(--transition-smooth)" }}>
+              {loading ? "..." : "Confirm"}
+            </button>
+            <button onClick={() => setPendingConfirm(null)}
+              style={{ background:"transparent", border:"1px solid var(--glass-border)", color:"var(--txt4)",
+                cursor:"pointer", padding:"2px 8px", fontSize:10, fontWeight:600, borderRadius:5 }}>
+              Cancel
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  }
+
   // ── SessionCard ─────────────────────────────────────────────────────────
 
   function SessionCard({ session, onResume }) {
@@ -388,7 +482,7 @@
 
   // ── PowersPanel — Jarvis capabilities dashboard ─────────────────────
 
-  function PowersPanel({ powers, onRunImprove, onForgetRule, onOptimizeHooks, onEnsureAgents, onRecommendAgents, onBack, sessions }) {
+  function PowersPanel({ powers, onRunImprove, onForgetRule, onOptimizeHooks, onEnsureAgents, onRecommendAgents, onBack, sessions, proposals, onRespondToProposal }) {
     const [activeTab, setActiveTab] = useState("agents");
     const [improving, setImproving] = useState(false);
     const [improveResult, setImproveResult] = useState(null);
@@ -400,6 +494,7 @@
     const [selectedSession, setSelectedSession] = useState(null);
 
     const tabs = [
+      { id: "proposals", label: "\uD83D\uDCA1 Requests" },
       { id: "agents", label: "\🤖 Agents" },
       { id: "workflows", label: "\🔄 Workflows" },
       { id: "improve", label: "\🧠 Improve" },
@@ -487,6 +582,22 @@
             <button key={t.id} onClick={() => setActiveTab(t.id)} style={tabBtnStyle(activeTab === t.id)}>{t.label}</button>
           ))}
         </div>
+
+        {/* ── Proposals Tab ── */}
+        {activeTab === "proposals" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ fontSize: 11, color: "var(--txt3)", lineHeight: 1.4, padding: "4px 0" }}>
+              Capability gaps JARVIS detected. Approve to execute, defer to revisit later, or dismiss.
+            </div>
+            {(proposals || []).length === 0 ? (
+              <div style={{ fontSize: 11, color: "var(--txt4)", textAlign: "center", padding: "16px 0" }}>
+                No proposals yet. JARVIS will surface requests after analyzing your projects over a few cycles.
+              </div>
+            ) : (proposals || []).map(p => (
+              <ProposalCard key={p.id} proposal={p} onRespond={onRespondToProposal}/>
+            ))}
+          </div>
+        )}
 
         {/* ── Agents Tab ── */}
         {activeTab === "agents" && (
@@ -729,7 +840,7 @@
   // ── FloatingBubble — orb + expanded panel ─────────────────────────────
 
   function FloatingBubble({ briefing, isExpanded, onToggle, onResume, onDismissInsight, onAction, onRefresh, isDesktop,
-    powersOpen, onTogglePowers, onToggleDeepDive, powers, onRunImprove, onForgetRule, onOptimizeHooks, onEnsureAgents, onRecommendAgents, sessions }) {
+    powersOpen, onTogglePowers, onToggleDeepDive, powers, onRunImprove, onForgetRule, onOptimizeHooks, onEnsureAgents, onRecommendAgents, sessions, onRespondToProposal }) {
     const [isHovered, setIsHovered] = useState(false);
     const [position, setPosition] = useState(() => {
       try {
@@ -919,6 +1030,8 @@
                   onRecommendAgents={onRecommendAgents}
                   onBack={onTogglePowers}
                   sessions={briefing.sessions}
+                  proposals={briefing.proposals}
+                  onRespondToProposal={onRespondToProposal}
                 />
               ) : (
                 <>
@@ -952,6 +1065,18 @@
                         onAction={i.action && i.sessionId && onAction ? (action, confirmed) => onAction(i.sessionId, action, confirmed) : null}/>)}
                       {otherInsights.length > 4 && (
                         <div style={{ fontSize:11, color:"var(--txt4)", paddingLeft:4 }}>+{otherInsights.length - 4} more</div>
+                      )}
+                    </div>
+                  )}
+
+                  {briefing.proposals?.length > 0 && (
+                    <div style={{ display:"flex", flexDirection:"column", gap:4 }}>
+                      <div style={{ fontSize:10, fontWeight:700, color:"var(--acc)", textTransform:"uppercase", letterSpacing:.5 }}>
+                        {"\uD83D\uDCA1"} Jarvis Requests ({briefing.proposals.length})
+                      </div>
+                      {briefing.proposals.slice(0, 3).map(p => <ProposalCard key={p.id} proposal={p} onRespond={onRespondToProposal}/>)}
+                      {briefing.proposals.length > 3 && (
+                        <div style={{ fontSize:11, color:"var(--txt4)", paddingLeft:4 }}>+{briefing.proposals.length - 3} more</div>
                       )}
                     </div>
                   )}
@@ -1009,7 +1134,7 @@
             isHovered={isHovered}
           />
 
-          {/* Badge */}
+          {/* Badge — critical issues */}
           {critCount > 0 && (
             <div style={{
               position:"absolute", top:-4, right:-4,
@@ -1022,6 +1147,22 @@
               border:"2px solid var(--bg)", zIndex:1, pointerEvents:"none",
             }}>
               {critCount}
+            </div>
+          )}
+
+          {/* Badge — proposals (shown only when no critical issues) */}
+          {critCount === 0 && briefing.proposals?.length > 0 && (
+            <div style={{
+              position:"absolute", top:-4, right:-4,
+              minWidth:18, height:18, borderRadius:9, padding:"0 5px",
+              background:"linear-gradient(135deg, var(--acc), color-mix(in srgb, var(--acc) 70%, var(--grn)))",
+              color:"var(--bg)", fontSize:10, fontWeight:700,
+              display:"flex", alignItems:"center", justifyContent:"center",
+              boxShadow:"0 2px 8px color-mix(in srgb, var(--acc) 40%, transparent)",
+              animation:"jarvisBadgePop .3s cubic-bezier(.34,1.56,.64,1)",
+              border:"2px solid var(--bg)", zIndex:1, pointerEvents:"none",
+            }}>
+              {briefing.proposals.length}
             </div>
           )}
 
@@ -1050,7 +1191,7 @@
   // ── JarvisOrb — single entry point ────────────────────────────────────
 
   function JarvisOrb({ briefing, isMinimized, onToggle, onResume, onDismissInsight, onAction, onRefresh, isDesktop,
-    powersOpen, onTogglePowers, onToggleDeepDive, powers, onRunImprove, onForgetRule, onOptimizeHooks, onEnsureAgents, onRecommendAgents, sessions }) {
+    powersOpen, onTogglePowers, onToggleDeepDive, powers, onRunImprove, onForgetRule, onOptimizeHooks, onEnsureAgents, onRecommendAgents, sessions, onRespondToProposal }) {
     if (!briefing) return null;
     return (
       <FloatingBubble
@@ -1072,6 +1213,7 @@
         onEnsureAgents={onEnsureAgents}
         onRecommendAgents={onRecommendAgents}
         sessions={sessions}
+        onRespondToProposal={onRespondToProposal}
       />
     );
   }
@@ -1204,9 +1346,18 @@
         .then(r => r.json());
     }, [apiBase, headers]);
 
+    const respondToProposal = useCallback((proposalId, response, confirmed = false) => {
+      return fetch(`${apiBase}/api/jarvis/proposal/respond`, { method: "POST", headers: headers(), body: JSON.stringify({ proposalId, response, confirmed }) })
+        .then(r => r.json())
+        .then(d => {
+          if (d.ok || d.requiresConfirmation) fetchBriefing(true);
+          return d;
+        });
+    }, [apiBase, headers, fetchBriefing]);
+
     return {
       briefing, isMinimized, showPanel: !!briefing, toggleMinimize, refresh: fetchBriefing,
-      dismissInsight, executeAction, handleInit, handleWsMessage,
+      dismissInsight, executeAction, handleInit, handleWsMessage, respondToProposal,
       // Powers
       powersOpen, togglePowers, powers,
       runImprove, forgetRule, optimizeHooks, ensureAgents, recommendAgents,
@@ -1399,7 +1550,7 @@
 
   // ── JarvisDeepDive — full-screen comprehensive insight view ─────────────
 
-  function JarvisDeepDive({ briefing, onClose, onDismissInsight, onAction, onRefresh }) {
+  function JarvisDeepDive({ briefing, onClose, onDismissInsight, onAction, onRefresh, onRespondToProposal }) {
     const [selectedSessionId, setSelectedSessionId] = useState(null);
     const [filterSeverity, setFilterSeverity] = useState("all");
     const [filterCategory, setFilterCategory] = useState("all");
@@ -1724,6 +1875,23 @@
               </div>
             )}
 
+            {/* Jarvis Requests section — shown before insight categories */}
+            {!selectedSession && briefing.proposals?.length > 0 && filterCategory === "all" && (
+              <div style={{ marginBottom: 24 }}>
+                <div style={{
+                  display: "flex", alignItems: "center", gap: 8, marginBottom: 10,
+                  paddingBottom: 6, borderBottom: "1px solid var(--glass-border)",
+                }}>
+                  <span style={{ fontSize: 16 }}>{"\uD83D\uDCA1"}</span>
+                  <span style={{ fontSize: 14, fontWeight: 700, color: "var(--acc)" }}>Jarvis Requests</span>
+                  <span style={{ fontSize: 11, color: "var(--txt4)" }}>({briefing.proposals.length})</span>
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {briefing.proposals.map(p => <ProposalCard key={p.id} proposal={p} onRespond={onRespondToProposal}/>)}
+                </div>
+              </div>
+            )}
+
             {groupedInsights.map(group => (
               <div key={group.category} style={{ marginBottom: 24 }}>
                 <div style={{
@@ -1806,7 +1974,7 @@
   // ── Export ──────────────────────────────────────────────────────────────
 
   window.JarvisUI = {
-    InsightCard, SessionCard, JarvisOrb, FloatingBubble, SiriOrb, PowersPanel,
+    InsightCard, ProposalCard, SessionCard, JarvisOrb, FloatingBubble, SiriOrb, PowersPanel,
     JarvisDeepDive, DeepDiveInsightCard, SessionHealthRing,
     useJarvis, injectStyles,
   };
