@@ -1989,6 +1989,408 @@ Identify frontend performance issues and return prioritized recommendations.
 //
 // Every change is logged to .jarvis/improvements.json for full auditability.
 
+// ── Session Intelligence ────────────────────────────────────────────────────
+// Mines session output arrays for behavioral signals: command patterns, file edits,
+// error patterns, timing, commit cadence. Writes compact observations to
+// .claude/rules/jarvis-observations.md so Claude Code absorbs them at session start.
+// Zero API cost — uses existing data streams and file-based communication.
+
+class SessionIntelligence {
+  constructor(memory) {
+    this._memory = memory;
+    this._lastAnalyzedTimestamps = {}; // { projectId: lastOutputTimestamp }
+    this._observationAges = {};        // { projectId: { observationType: { createdAt, lastCorrelated } } }
+  }
+
+  /**
+   * Scan project.output[] for behavioral signals.
+   * Only processes entries newer than the last analyzed timestamp (incremental).
+   * Returns a signals object or null if insufficient data.
+   */
+  analyze(project) {
+    try {
+      const output = project.output || [];
+      if (output.length === 0) return null;
+
+      const lastTs = this._lastAnalyzedTimestamps[project.id] || 0;
+      const newEntries = output.filter(e => (e.time || 0) > lastTs);
+      if (newEntries.length === 0) return null;
+
+      // Update watermark
+      const maxTime = Math.max(...newEntries.map(e => e.time || 0).filter(t => t > 0));
+      if (maxTime > 0) this._lastAnalyzedTimestamps[project.id] = maxTime;
+
+      // Accumulate signals from ALL output (not just new), but only recompute when new data arrives
+      const allEntries = output;
+
+      const signals = {
+        hotFiles: null,
+        commitCadence: null,
+        workHours: null,
+        testBeforeCommit: null,
+        recurringErrors: null,
+        commandFrequency: null,
+        sessionAvgDuration: null,
+      };
+
+      // A. Command patterns — look for tool use entries with shell/bash/terminal tools
+      try {
+        const commands = { commit: 0, push: 0, test: 0, install: 0, pull: 0, checkout: 0, branch: 0 };
+        const commitTimes = [];
+        for (const entry of allEntries) {
+          const toolName = entry.toolUse?.name || "";
+          const isShell = /bash|shell|execute|terminal/i.test(toolName);
+          if (!isShell) continue;
+          const input = (typeof entry.toolUse?.input === "string"
+            ? entry.toolUse.input
+            : entry.toolUse?.input?.command || entry.toolUse?.input?.cmd || "");
+          if (!input) continue;
+
+          if (/git\s+commit/i.test(input)) { commands.commit++; if (entry.time) commitTimes.push(entry.time); }
+          if (/git\s+push/i.test(input)) commands.push++;
+          if (/git\s+pull/i.test(input)) commands.pull++;
+          if (/git\s+checkout/i.test(input)) commands.checkout++;
+          if (/git\s+branch/i.test(input)) commands.branch++;
+          if (/npm\s+test|jest|pytest|vitest|mocha/i.test(input)) commands.test++;
+          if (/npm\s+install|pip\s+install|yarn\s+add/i.test(input)) commands.install++;
+        }
+        const total = Object.values(commands).reduce((a, b) => a + b, 0);
+        if (total >= 3) signals.commandFrequency = commands;
+
+        // Commit cadence
+        if (commitTimes.length >= 2) {
+          const hours = commitTimes.map(t => new Date(t).getHours());
+          const hourCounts = {};
+          for (const h of hours) hourCounts[h] = (hourCounts[h] || 0) + 1;
+          const preferredHour = +Object.entries(hourCounts).sort((a, b) => b[1] - a[1])[0][0];
+          signals.commitCadence = { preferredHour, avgBatchSize: null };
+        }
+      } catch {}
+
+      // B. File edit patterns — look for edit/write/file tool use
+      try {
+        const fileCounts = {};
+        for (const entry of allEntries) {
+          const toolName = entry.toolUse?.name || "";
+          if (!/edit|write|file/i.test(toolName)) continue;
+          const filePath = entry.toolUse?.input?.file_path || entry.toolUse?.input?.path || "";
+          if (!filePath) continue;
+          const basename = filePath.split("/").pop();
+          if (basename) fileCounts[basename] = (fileCounts[basename] || 0) + 1;
+        }
+        const sorted = Object.entries(fileCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+        if (sorted.length >= 1 && sorted[0][1] >= 3) {
+          signals.hotFiles = sorted.map(([file, editCount]) => ({ file, editCount }));
+        }
+      } catch {}
+
+      // C. Error patterns — entries with is_error === true
+      try {
+        const errorMsgs = {};
+        for (const entry of allEntries) {
+          if (!entry.is_error) continue;
+          const msg = (entry.text || "").trim().slice(0, 80);
+          if (!msg) continue;
+          // Normalize the error message for grouping
+          const key = msg.replace(/\d+/g, "N").replace(/['"][^'"]+['"]/g, "'...'").slice(0, 60);
+          errorMsgs[key] = (errorMsgs[key] || { message: msg, count: 0 });
+          errorMsgs[key].count++;
+        }
+        const topErrors = Object.values(errorMsgs).sort((a, b) => b.count - a.count).slice(0, 3);
+        if (topErrors.length > 0 && topErrors[0].count >= 3) {
+          signals.recurringErrors = topErrors;
+        }
+      } catch {}
+
+      // D. Session timing — from entry.time timestamps
+      try {
+        const times = allEntries.map(e => e.time).filter(t => t && t > 0);
+        if (times.length >= 3) {
+          const hours = times.map(t => new Date(t).getHours());
+          const hourCounts = {};
+          for (const h of hours) hourCounts[h] = (hourCounts[h] || 0) + 1;
+          const peakHour = +Object.entries(hourCounts).sort((a, b) => b[1] - a[1])[0][0];
+          const minHour = Math.min(...hours);
+          const maxHour = Math.max(...hours);
+          signals.workHours = { start: minHour, end: maxHour, peakHour };
+
+          // Session duration
+          const minTime = Math.min(...times);
+          const maxTime2 = Math.max(...times);
+          signals.sessionAvgDuration = Math.round((maxTime2 - minTime) / (1000 * 60));
+        }
+      } catch {}
+
+      // E. Test before commit — check if test commands appear before commit commands
+      try {
+        if (signals.commandFrequency) {
+          const { test, commit } = signals.commandFrequency;
+          if (commit >= 3) {
+            signals.testBeforeCommit = test > 0 && test >= commit * 0.5;
+          }
+        }
+      } catch {}
+
+      // Compute commit batch size (edits between commits)
+      try {
+        if (signals.commitCadence) {
+          let editsSinceLastCommit = 0;
+          let batchSizes = [];
+          for (const entry of allEntries) {
+            const toolName = entry.toolUse?.name || "";
+            if (/edit|write/i.test(toolName)) editsSinceLastCommit++;
+            if (/bash|shell|execute|terminal/i.test(toolName)) {
+              const input = (typeof entry.toolUse?.input === "string"
+                ? entry.toolUse.input
+                : entry.toolUse?.input?.command || entry.toolUse?.input?.cmd || "");
+              if (/git\s+commit/i.test(input) && editsSinceLastCommit > 0) {
+                batchSizes.push(editsSinceLastCommit);
+                editsSinceLastCommit = 0;
+              }
+            }
+          }
+          if (batchSizes.length >= 2) {
+            signals.commitCadence.avgBatchSize = Math.round(batchSizes.reduce((a, b) => a + b, 0) / batchSizes.length);
+          }
+        }
+      } catch {}
+
+      // Check if we have any meaningful signals
+      const hasSignals = Object.values(signals).some(v => v !== null);
+      return hasSignals ? signals : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Write compact observations to .claude/rules/jarvis-observations.md
+   * Returns true if observations were written, false otherwise.
+   */
+  writeObservations(project, signals) {
+    try {
+      if (!project.folder) return false;
+
+      const lines = ["# JARVIS Observations", ""];
+      const { hotFiles, commitCadence, workHours, testBeforeCommit, recurringErrors, commandFrequency } = signals;
+
+      if (workHours?.peakHour != null) {
+        lines.push(`- Peak activity hour: ${this._formatHour(workHours.peakHour)}`);
+      }
+      if (commitCadence?.preferredHour != null) {
+        lines.push(`- Commits typically around ${this._formatHour(commitCadence.preferredHour)}`);
+      }
+      if (commitCadence?.avgBatchSize != null) {
+        lines.push(`- Average ${commitCadence.avgBatchSize} file edits between commits`);
+      }
+      if (hotFiles?.length > 0) {
+        lines.push("- Hot files: " + hotFiles.map(f => f.file + " (" + f.editCount + "x)").join(", "));
+      }
+      if (testBeforeCommit === false) {
+        lines.push(`- Tests are not typically run before commits in this project`);
+      }
+      if (testBeforeCommit === true) {
+        lines.push(`- User runs tests before committing (good practice observed)`);
+      }
+      if (recurringErrors?.length > 0) {
+        lines.push(`- Recurring error: "${recurringErrors[0].message}" (${recurringErrors[0].count}x)`);
+      }
+      if (commandFrequency) {
+        const top = Object.entries(commandFrequency)
+          .filter(([, v]) => v >= 3)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 3);
+        if (top.length > 0) {
+          lines.push("- Frequent commands: " + top.map(([k, v]) => k + " (" + v + "x)").join(", "));
+        }
+      }
+
+      // Only write if we have at least 2 meaningful observations
+      const observationCount = lines.length - 2; // subtract header lines
+      if (observationCount < 2) return false;
+
+      // Cap at 15 lines max
+      while (lines.length > 15) lines.pop();
+
+      // Add timestamp
+      lines.push("");
+      lines.push(`_Updated: ${new Date().toISOString().replace("T", " ").slice(0, 16)}_`);
+
+      const rulesDir = path.join(project.folder, ".claude", "rules");
+      if (!fs.existsSync(rulesDir)) fs.mkdirSync(rulesDir, { recursive: true });
+
+      const obsPath = path.join(rulesDir, "jarvis-observations.md");
+
+      // Check expiry — drop observations older than 14 days
+      const ages = this._observationAges[project.id] || {};
+      const now = Date.now();
+      const fourteenDays = 14 * 24 * 60 * 60 * 1000;
+      for (const [key, meta] of Object.entries(ages)) {
+        if (now - meta.createdAt > fourteenDays && !meta.lastCorrelated) {
+          delete ages[key]; // expired, never validated
+        }
+      }
+
+      // Track ages for new observation types
+      const obsTypes = [];
+      if (workHours) obsTypes.push("workHours");
+      if (commitCadence) obsTypes.push("commitCadence");
+      if (hotFiles) obsTypes.push("hotFiles");
+      if (testBeforeCommit !== null) obsTypes.push("testBeforeCommit");
+      if (recurringErrors) obsTypes.push("recurringErrors");
+      for (const t of obsTypes) {
+        if (!ages[t]) ages[t] = { createdAt: now, lastCorrelated: null };
+      }
+      this._observationAges[project.id] = ages;
+
+      fs.writeFileSync(obsPath, lines.join("\n"));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Write global cross-project observations.
+   */
+  writeGlobalObservations(globalSignals) {
+    try {
+      if (!globalSignals) return false;
+      const lines = ["# JARVIS Global Observations", ""];
+
+      if (globalSignals.globalWorkHours) {
+        lines.push(`- Global peak activity: ${this._formatHour(globalSignals.globalWorkHours.peakHour)}`);
+      }
+      for (const p of (globalSignals.universalPatterns || [])) {
+        lines.push(`- ${p}`);
+      }
+      for (const e of (globalSignals.recurringErrorsGlobal || []).slice(0, 2)) {
+        lines.push(`- Cross-project error: "${e.message}" (${e.count}x across projects)`);
+      }
+
+      if (lines.length - 2 < 2) return false;
+
+      while (lines.length > 15) lines.pop();
+      lines.push("");
+      lines.push(`_Updated: ${new Date().toISOString().replace("T", " ").slice(0, 16)}_`);
+
+      // Write to JARVIS's own .claude/rules/
+      const jarvisRoot = path.dirname(__filename);
+      const rulesDir = path.join(jarvisRoot, ".claude", "rules");
+      if (!fs.existsSync(rulesDir)) fs.mkdirSync(rulesDir, { recursive: true });
+      fs.writeFileSync(path.join(rulesDir, "jarvis-observations.md"), lines.join("\n"));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Passive insight correlation — checks whether JARVIS insights led to user action.
+   * Records implicit positive/negative signals in memory.
+   */
+  correlateInsights(project, signals) {
+    try {
+      if (!signals?.commandFrequency) return;
+      const memory = this._memory;
+      const projectId = project.id;
+      const freq = signals.commandFrequency;
+
+      // Correlation map: insight type → command that validates it
+      const correlations = [
+        { insight: "uncommitted", command: "commit", minCount: 1 },
+        { insight: "unpushed",    command: "push",   minCount: 1 },
+        { insight: "no-modules",  command: "install", minCount: 1 },
+        { insight: "no-tests",    command: "test",   minCount: 1 },
+        { insight: "stale",       command: "pull",   minCount: 1 },
+      ];
+
+      // Check which insights are currently active for this project
+      const dismissals = memory.getDismissals();
+      const recentDismissals = dismissals.filter(d =>
+        d.id.includes(projectId) && (Date.now() - d.ts) < 3 * 24 * 60 * 60 * 1000
+      );
+
+      for (const { insight, command, minCount } of correlations) {
+        const hasInsight = recentDismissals.some(d => d.id.includes(insight));
+        // Also check if this insight was recently shown (not just dismissed)
+        if (freq[command] >= minCount) {
+          // User performed the action — record positive signal
+          memory.recordAction(projectId, `corr-${insight}`, "success");
+
+          // Update correlation tracking for observation expiry
+          const ages = this._observationAges[projectId] || {};
+          if (ages[insight]) ages[insight].lastCorrelated = Date.now();
+        }
+      }
+    } catch {}
+  }
+
+  /**
+   * Aggregate signals across multiple projects to find universal patterns.
+   */
+  aggregateAcrossProjects(projectSignals) {
+    try {
+      const global = {
+        globalWorkHours: null,
+        universalPatterns: [],
+        recurringErrorsGlobal: [],
+      };
+
+      // Aggregate peak hours
+      const peakHours = [];
+      const testBeforeCommitCounts = { yes: 0, no: 0 };
+      const allErrors = {};
+
+      for (const [, signals] of projectSignals) {
+        if (signals.workHours?.peakHour != null) peakHours.push(signals.workHours.peakHour);
+        if (signals.testBeforeCommit === true) testBeforeCommitCounts.yes++;
+        if (signals.testBeforeCommit === false) testBeforeCommitCounts.no++;
+        for (const err of (signals.recurringErrors || [])) {
+          const key = err.message.slice(0, 40);
+          allErrors[key] = allErrors[key] || { message: err.message, count: 0 };
+          allErrors[key].count += err.count;
+        }
+      }
+
+      // Global work hours — need ≥3 projects
+      if (peakHours.length >= 3) {
+        const hourCounts = {};
+        for (const h of peakHours) hourCounts[h] = (hourCounts[h] || 0) + 1;
+        const topHour = Object.entries(hourCounts).sort((a, b) => b[1] - a[1])[0];
+        if (topHour && topHour[1] >= 2) {
+          global.globalWorkHours = { peakHour: +topHour[0] };
+        }
+      }
+
+      // Universal patterns — true across ≥3 projects
+      if (testBeforeCommitCounts.no >= 3) {
+        global.universalPatterns.push("Tests are rarely run before commits across projects");
+      }
+      if (testBeforeCommitCounts.yes >= 3) {
+        global.universalPatterns.push("User consistently tests before committing");
+      }
+
+      // Cross-project errors
+      const topGlobalErrors = Object.values(allErrors).sort((a, b) => b.count - a.count).slice(0, 3);
+      if (topGlobalErrors.length > 0 && topGlobalErrors[0].count >= 3) {
+        global.recurringErrorsGlobal = topGlobalErrors;
+      }
+
+      return global;
+    } catch {
+      return { globalWorkHours: null, universalPatterns: [], recurringErrorsGlobal: [] };
+    }
+  }
+
+  _formatHour(h) {
+    if (h === 0) return "12am";
+    if (h < 12) return `${h}am`;
+    if (h === 12) return "12pm";
+    return `${h - 12}pm`;
+  }
+}
+
 class JarvisSelfImprover {
   constructor(rootDir, memory) {
     this._rootDir = rootDir;
@@ -1997,6 +2399,7 @@ class JarvisSelfImprover {
     this._log     = this._loadLog();
     this._lastRun = 0;
     this._minInterval = 5 * 60 * 1000; // at most once per 5 min
+    this._sessionIntel = new SessionIntelligence(memory);
   }
 
   _loadLog() {
@@ -2023,7 +2426,7 @@ class JarvisSelfImprover {
    * Throttled to at most once per 5 minutes. Requires >= 5 data points.
    * Returns array of { type, reason, ... } change records.
    */
-  async runCycle(briefing, hookMgr, agentMgr) {
+  async runCycle(briefing, hookMgr, agentMgr, projects) {
     if (Date.now() - this._lastRun < this._minInterval) return [];
     this._lastRun = Date.now();
 
@@ -2079,6 +2482,42 @@ class JarvisSelfImprover {
       }
     }
 
+    // ── 6. Session intelligence ─────────────────────────────────────────────────
+    // Mine session output for behavioral signals and write .claude/rules/ observations
+    const intel = this._sessionIntel;
+    const allSignals = new Map();
+    const rawProjects = projects || [];
+    for (const session of (briefing.sessions || [])) {
+      try {
+        // Find the raw project data (which has output[]) by matching session.id
+        const rawProject = rawProjects.find(p => p.id === session.id);
+        if (!rawProject?.output?.length) continue;
+
+        const project = { id: session.id, output: rawProject.output, folder: rawProject.folder || session.context?.folder };
+        const signals = intel.analyze(project);
+        if (!signals) continue;
+        allSignals.set(session.id, signals);
+
+        // Write per-project observations
+        if (project.folder) {
+          const wrote = intel.writeObservations(project, signals);
+          if (wrote) changes.push({ type: "observation", project: session.name,
+            reason: "Updated session intelligence observations" });
+        }
+
+        // Passive insight correlation
+        intel.correlateInsights(project, signals);
+      } catch {}
+    }
+
+    // Cross-project aggregation
+    if (allSignals.size >= 2) {
+      try {
+        const globalSignals = intel.aggregateAcrossProjects(allSignals);
+        intel.writeGlobalObservations(globalSignals);
+      } catch {}
+    }
+
     // ── Record all changes ─────────────────────────────────────────────────────
     for (const c of changes) this._record(c);
     return changes;
@@ -2089,7 +2528,10 @@ class JarvisSelfImprover {
     const counts = {};
     for (const d of dismissals) {
       const pattern = d.id.replace(/-[^-]+$/, "");
-      counts[pattern] = (counts[pattern] || 0) + 1;
+      // Time-decayed counting — recent dismissals matter more than old ones
+      const ageHours = (Date.now() - (d.ts || 0)) / (1000 * 60 * 60);
+      const weight = Math.max(0.1, 1 - (ageHours / (14 * 24))); // decay over 14 days
+      counts[pattern] = (counts[pattern] || 0) + weight;
     }
     const top = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
     if (!top || top[1] < 5) return null;
@@ -2454,7 +2896,7 @@ class Jarvis {
       // Runs asynchronously so it never blocks the briefing response
       // Only runs if there's new data to learn from
       if (this._memory.hasNewData()) {
-        this._improver.runCycle(briefing, this._hookMgr, this._agentMgr)
+        this._improver.runCycle(briefing, this._hookMgr, this._agentMgr, this._projects)
           .then(() => this._memory.markReflected())
           .catch(() => {});
       }
@@ -2677,7 +3119,7 @@ class Jarvis {
         this._improver._lastRun = 0;
         const briefing = this.getCachedBriefing();
         if (!briefing) return res.json({ ok: false, message: "No cached briefing — call /briefing first" });
-        const changes = await this._improver.runCycle(briefing, this._hookMgr, this._agentMgr);
+        const changes = await this._improver.runCycle(briefing, this._hookMgr, this._agentMgr, this._projects);
         res.json({ ok: true, changes, message: changes.length > 0
           ? `${changes.length} improvement${changes.length !== 1 ? "s" : ""} applied`
           : "No improvements needed — Jarvis is already well-calibrated" });
