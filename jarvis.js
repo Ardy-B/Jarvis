@@ -969,7 +969,7 @@ async function assessActionRisk(project, action) {
 class JarvisMemory {
   constructor(memoryPath) {
     this._path = memoryPath;
-    this._data = { snapshots: [], dismissals: [], actions: [], rules: [], engagements: [], version: 1,
+    this._data = { snapshots: [], dismissals: [], actions: [], rules: [], engagements: [], agentRuns: [], version: 1,
       proposals: { approved: [], rejected: [], deferred: [] } };
     this._maxSnapshots = 50;
     this._maxDismissals = 200;
@@ -999,6 +999,7 @@ class JarvisMemory {
         const parsed = JSON.parse(raw);
         if (parsed && parsed.version) {
           if (!parsed.engagements) parsed.engagements = [];
+          if (!parsed.agentRuns) parsed.agentRuns = [];
           this._data = parsed;
         }
       }
@@ -1179,6 +1180,49 @@ class JarvisMemory {
   getApprovedProposals() {
     this._ensureProposals();
     return this._data.proposals.approved;
+  }
+
+  // ── Agent run memory ──
+
+  recordAgentRun(run) {
+    if (!this._data.agentRuns) this._data.agentRuns = [];
+    this._data.agentRuns.push({ ...run, ts: Date.now() });
+    if (this._data.agentRuns.length > 100) {
+      this._data.agentRuns = this._data.agentRuns.slice(-100);
+    }
+    this._save();
+  }
+
+  updateAgentRun(runId, update) {
+    if (!this._data.agentRuns) return;
+    const idx = this._data.agentRuns.findIndex(r => r.id === runId);
+    if (idx >= 0) {
+      this._data.agentRuns[idx] = { ...this._data.agentRuns[idx], ...update };
+      this._save();
+    }
+  }
+
+  getAgentRuns(projectId) {
+    if (!this._data.agentRuns) return [];
+    if (projectId) return this._data.agentRuns.filter(r => r.projectId === projectId);
+    return this._data.agentRuns;
+  }
+
+  getLastAgentRun(agentId, projectId) {
+    if (!this._data.agentRuns) return null;
+    for (let i = this._data.agentRuns.length - 1; i >= 0; i--) {
+      const r = this._data.agentRuns[i];
+      if (r.agentId === agentId && r.projectId === projectId) return r;
+    }
+    return null;
+  }
+
+  getDailyAgentCost() {
+    if (!this._data.agentRuns) return 0;
+    const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+    return this._data.agentRuns
+      .filter(r => r.ts >= dayStart.getTime())
+      .reduce((sum, r) => sum + (r.cost || 0), 0);
   }
 }
 
@@ -1938,6 +1982,12 @@ class JarvisHookManager {
 // Maintains a catalogue of specialized subagent definitions and writes their
 // .claude/agents/*.md files so Claude Code can spawn them on demand.
 // Jarvis calls ensureAgents() at startup — idempotent (only writes missing files).
+// Auto-spawn: agents with shouldAutoSpawn conditions run automatically when triggered.
+
+const AGENT_COOLDOWN_MS   = 4 * 60 * 60 * 1000; // 4 hours between same agent on same project
+const MAX_CONCURRENT_AGENTS = 2;
+const MAX_AGENT_BUDGET_USD  = 0.50;  // per agent run
+const MAX_DAILY_AGENT_BUDGET_USD = 5.00;
 
 const AGENT_SPECS = {
   "security-deep": {
@@ -1945,30 +1995,257 @@ const AGENT_SPECS = {
     description: "Deep security scan: exposed secrets, auth-flow review, CORS audit, env config",
     file: "security-deep.md",
     triggers: ["isAuthSensitive"],
+    shouldAutoSpawn: (personality, context, insights) =>
+      personality?.isAuthSensitive && insights.some(i => i.type === "security" && (i.severity === "error" || i.severity === "warning")),
   },
   "dependency-graph": {
     name: "Jarvis Dependency Graph Agent",
     description: "Dependency tree analysis: wrong categories, duplicate capabilities, missing scripts",
     file: "dependency-graph.md",
     triggers: ["hasPackageJson"],
+    shouldAutoSpawn: (personality, context, insights) =>
+      context?.techStack?.length > 0 && insights.filter(i => i.id?.includes("unused-dep") || i.id?.includes("env-schema")).length >= 2,
   },
   "performance-audit": {
     name: "Jarvis Performance Audit Agent",
     description: "Frontend performance review: bundle size, re-render patterns, Next.js specifics",
     file: "performance-audit.md",
     triggers: ["isReact", "isNextJs"],
+    shouldAutoSpawn: (personality, context, insights) =>
+      (context?.framework === "React" || context?.framework === "Next.js") && insights.some(i => i.id?.includes("god-file")),
   },
   "git-quality": {
     name: "Jarvis Git Quality Agent",
     description: "Commit hygiene review: message quality, velocity trends, bus factor analysis, stale branches",
     file: "git-quality.md",
     triggers: ["isGit"],
+    shouldAutoSpawn: (personality, context, insights) =>
+      insights.some(i => i.id?.includes("commit-quality") || i.id?.includes("velocity-drop")),
   },
   "code-smell": {
     name: "Jarvis Code Smell Agent",
     description: "Source quality review: god files, unused deps, test coverage gaps, env schema drift",
     file: "code-smell.md",
     triggers: ["hasSrc"],
+    shouldAutoSpawn: (personality, context, insights) =>
+      insights.filter(i => i.id?.includes("god-file") || i.id?.includes("test-gap")).length >= 2,
+  },
+};
+
+// ── Dynamic Agent Templates ──────────────────────────────────────────────────
+//
+// Content-aware agent templates that compose prompts based on what's actually
+// in the project. These generate ephemeral agents tailored to specific findings.
+
+const DYNAMIC_AGENT_TEMPLATES = {
+  "monolith-refactor": {
+    name: "Monolith Refactor Advisor",
+    description: "Proposes modularization strategies for oversized files",
+    condition: (ctx, personality, insights) =>
+      insights.filter(i => i.id?.includes("god-file")).length >= 2,
+    buildPrompt: (ctx, insights) => {
+      const godFiles = insights.filter(i => i.id?.includes("god-file")).map(i => i.detail || i.title);
+      return `# Monolith Refactor Advisor
+
+You are a specialized refactoring advisor deployed by Jarvis.
+
+## Context
+- Tech stack: ${(ctx?.techStack || []).join(", ") || "unknown"}
+- Framework: ${ctx?.framework || "unknown"}
+- God files detected: ${godFiles.join("; ")}
+
+## Mission
+Analyze the oversized files and propose a concrete modularization strategy.
+
+## Steps
+1. Read each god file and identify distinct responsibilities
+2. Propose specific file splits with suggested filenames
+3. Identify shared dependencies that would need extraction
+4. Estimate effort level (low/medium/high) for each split
+
+## Output Format
+Return JSON:
+\`\`\`json
+{
+  "severity": "medium",
+  "findings": [
+    { "type": "refactor-proposal", "file": "path", "lines": 0, "proposedSplits": ["module1.js", "module2.js"], "rationale": "...", "effort": "medium" }
+  ],
+  "summary": "one-sentence summary"
+}
+\`\`\`
+
+## Constraints
+- Read-only analysis — never modify files
+- Focus on practical, incremental splits — not ideal architecture`;
+    },
+  },
+
+  "api-contract": {
+    name: "API Contract Validator",
+    description: "Audits REST endpoint consistency, error handling, and documentation",
+    condition: (ctx) =>
+      ctx?.techStack?.some(s => ["Express", "Fastify", "Django", "Flask", "FastAPI"].includes(s)),
+    buildPrompt: (ctx) => `# API Contract Validator
+
+You are a specialized API consistency auditor deployed by Jarvis.
+
+## Context
+- Framework: ${ctx?.framework || (ctx?.techStack || []).join(", ")}
+- Description: ${ctx?.description || "unknown"}
+
+## Mission
+Audit all API endpoints for consistency, error handling, and documentation gaps.
+
+## Steps
+1. Find all route definitions (app.get, app.post, router.*, @app.route, etc.)
+2. Check for consistent error response format across endpoints
+3. Verify auth middleware is applied consistently
+4. Flag endpoints missing input validation
+5. Check for inconsistent URL naming conventions
+
+## Output Format
+Return JSON:
+\`\`\`json
+{
+  "severity": "medium|low",
+  "findings": [
+    { "type": "inconsistent-error|missing-auth|missing-validation|naming-convention", "file": "path", "line": 0, "detail": "..." }
+  ],
+  "summary": "one-sentence summary"
+}
+\`\`\`
+
+## Constraints
+- Read-only analysis — never modify files`,
+  },
+
+  "env-config-audit": {
+    name: "Environment Config Auditor",
+    description: "Cross-checks .env files, validates config completeness and security",
+    condition: (ctx, personality, insights) =>
+      insights.some(i => i.id?.includes("env-schema") || i.id?.includes("env-gitignore")),
+    buildPrompt: (ctx, insights) => {
+      const envIssues = insights.filter(i => i.id?.includes("env")).map(i => i.title);
+      return `# Environment Config Auditor
+
+You are a specialized environment configuration auditor deployed by Jarvis.
+
+## Context
+- Known issues: ${envIssues.join("; ")}
+- Project folder: check for .env, .env.example, .env.local, .env.production, etc.
+
+## Mission
+Perform a thorough audit of environment configuration safety and completeness.
+
+## Steps
+1. Compare .env.example keys vs .env keys — flag missing vars
+2. Check if .env is in .gitignore
+3. Look for hardcoded secrets in source files that should be env vars
+4. Verify .env.example has safe placeholder values (not real secrets)
+5. Check for environment-specific configs (.env.production, .env.staging)
+
+## Output Format
+Return JSON:
+\`\`\`json
+{
+  "severity": "high|medium|low",
+  "findings": [
+    { "type": "missing-key|exposed-secret|not-gitignored|hardcoded-value", "file": "path", "detail": "..." }
+  ],
+  "summary": "one-sentence summary"
+}
+\`\`\`
+
+## Constraints
+- Read-only analysis — never modify files
+- Never output actual secret values in findings`;
+    },
+  },
+
+  "docker-health": {
+    name: "Docker Configuration Auditor",
+    description: "Reviews Dockerfile and docker-compose for best practices",
+    condition: (ctx) => {
+      if (!ctx?.folder) return false;
+      return fs.existsSync(path.join(ctx.folder, "Dockerfile")) || fs.existsSync(path.join(ctx.folder, "docker-compose.yml"));
+    },
+    buildPrompt: (ctx) => `# Docker Configuration Auditor
+
+You are a specialized Docker audit subagent deployed by Jarvis.
+
+## Context
+- Project: ${ctx?.description || "unknown"}
+- Stack: ${(ctx?.techStack || []).join(", ") || "unknown"}
+
+## Mission
+Audit Docker configuration for security, size, and best practices.
+
+## Steps
+1. Read Dockerfile — check for: multi-stage builds, running as non-root, .dockerignore, pinned base image versions
+2. Read docker-compose.yml — check for: exposed ports, volume mounts, health checks, restart policies
+3. Check if .dockerignore exists and excludes node_modules, .env, .git
+4. Flag any secrets passed as build args or ENV
+
+## Output Format
+Return JSON:
+\`\`\`json
+{
+  "severity": "high|medium|low",
+  "findings": [
+    { "type": "security|size|best-practice", "file": "path", "line": 0, "detail": "...", "fix": "..." }
+  ],
+  "summary": "one-sentence summary"
+}
+\`\`\`
+
+## Constraints
+- Read-only — never modify files`,
+  },
+
+  "test-strategy": {
+    name: "Test Strategy Advisor",
+    description: "Analyzes test coverage gaps and proposes testing strategy",
+    condition: (ctx, personality, insights) =>
+      insights.filter(i => i.id?.includes("test-gap") || i.id?.includes("no-tests")).length >= 1 && (ctx?.techStack?.length || 0) > 0,
+    buildPrompt: (ctx, insights) => {
+      const testIssues = insights.filter(i => i.id?.includes("test")).map(i => i.title);
+      return `# Test Strategy Advisor
+
+You are a specialized testing strategy subagent deployed by Jarvis.
+
+## Context
+- Stack: ${(ctx?.techStack || []).join(", ")}
+- Framework: ${ctx?.framework || "unknown"}
+- Has test library: ${ctx?.hasTests ? "yes" : "no"}
+- Issues found: ${testIssues.join("; ")}
+
+## Mission
+Propose a practical testing strategy prioritized by risk and value.
+
+## Steps
+1. Scan for existing test files — understand current coverage
+2. Identify critical paths with no tests (auth, data mutation, API endpoints)
+3. Recommend test framework if none exists
+4. Propose 5-10 specific test files to create, ordered by priority
+5. For each, describe what to test and why it matters
+
+## Output Format
+Return JSON:
+\`\`\`json
+{
+  "severity": "medium",
+  "findings": [
+    { "type": "missing-test|critical-untested|framework-recommendation", "file": "path", "detail": "...", "priority": 1 }
+  ],
+  "summary": "one-sentence summary"
+}
+\`\`\`
+
+## Constraints
+- Read-only analysis — never create test files
+- Focus on practical, high-impact tests — not 100% coverage`;
+    },
   },
 };
 
@@ -1998,24 +2275,96 @@ class JarvisAgentManager {
   }
 
   /** Return which agents are relevant for a project given its personality and context. */
-  selectAgentsForProject(personality, context) {
-    const stack = (context && context.stack) || [];
+  selectAgentsForProject(personality, context, insights = []) {
+    const stack = (context && context.techStack) || [];
     const active = [];
     if (personality && personality.isAuthSensitive) active.push("security-deep");
-    if (context && context.hasPackageJson)           active.push("dependency-graph");
+    if (context && context.techStack?.length > 0)   active.push("dependency-graph");
     if (stack.includes("React") || stack.includes("Next.js")) active.push("performance-audit");
-    return active.map(id => ({ id, ...AGENT_SPECS[id] }));
+
+    const staticAgents = active.map(id => ({ id, ...AGENT_SPECS[id], dynamic: false }));
+
+    // Dynamic agents — composed from templates based on project content
+    const dynamicAgents = [];
+    const staticDomains = new Set(active);
+    for (const [templateId, template] of Object.entries(DYNAMIC_AGENT_TEMPLATES)) {
+      if (staticDomains.has(templateId)) continue;
+      try {
+        if (template.condition(context, personality, insights)) {
+          dynamicAgents.push({
+            id: `dynamic-${templateId}`,
+            name: template.name,
+            description: template.description,
+            dynamic: true,
+            prompt: template.buildPrompt(context, insights),
+          });
+        }
+      } catch {}
+    }
+
+    return [...staticAgents, ...dynamicAgents];
+  }
+
+  /** Evaluate which agents should auto-spawn for a project. */
+  evaluateAutoSpawn(projectId, personality, context, insights, memory) {
+    const candidates = [];
+
+    // Static agents with shouldAutoSpawn conditions
+    for (const [agentId, spec] of Object.entries(AGENT_SPECS)) {
+      if (!spec.shouldAutoSpawn) continue;
+      try {
+        if (!spec.shouldAutoSpawn(personality, context, insights)) continue;
+      } catch { continue; }
+
+      // Check cooldown
+      const lastRun = memory.getLastAgentRun(agentId, projectId);
+      if (lastRun && (Date.now() - lastRun.ts) < AGENT_COOLDOWN_MS) continue;
+
+      // Read prompt from disk
+      const promptPath = path.join(this._dir, spec.file);
+      let prompt;
+      try { prompt = fs.readFileSync(promptPath, "utf8"); } catch { continue; }
+
+      candidates.push({ agentId, projectId, prompt, dynamic: false, name: spec.name });
+    }
+
+    // Dynamic agents — check conditions and compose prompts
+    for (const [templateId, template] of Object.entries(DYNAMIC_AGENT_TEMPLATES)) {
+      const agentId = `dynamic-${templateId}`;
+      try {
+        if (!template.condition(context, personality, insights)) continue;
+      } catch { continue; }
+
+      const lastRun = memory.getLastAgentRun(agentId, projectId);
+      if (lastRun && (Date.now() - lastRun.ts) < AGENT_COOLDOWN_MS) continue;
+
+      try {
+        const prompt = template.buildPrompt(context, insights);
+        candidates.push({ agentId, projectId, prompt, dynamic: true, name: template.name });
+      } catch {}
+    }
+
+    return candidates;
   }
 
   /** List all known agents with their on-disk status. */
   listAgents() {
-    return Object.entries(AGENT_SPECS).map(([id, spec]) => ({
+    const staticAgents = Object.entries(AGENT_SPECS).map(([id, spec]) => ({
       id,
       name: spec.name,
       description: spec.description,
       triggers: spec.triggers,
+      dynamic: false,
       exists: fs.existsSync(path.join(this._dir, spec.file)),
     }));
+    const dynamicAgents = Object.entries(DYNAMIC_AGENT_TEMPLATES).map(([id, tmpl]) => ({
+      id: `dynamic-${id}`,
+      name: tmpl.name,
+      description: tmpl.description,
+      dynamic: true,
+      exists: true, // always available (composed on demand)
+    }));
+    return [...staticAgents, ...dynamicAgents];
   }
 
   _securityDeepMd() {
@@ -3000,6 +3349,10 @@ class Jarvis {
 
     // Auto-write agent definition files on startup (idempotent)
     try { this._agentMgr.ensureAgents(); } catch {}
+
+    // Agent auto-spawn state
+    this._agentSpawner = null;        // set by registerAgentSpawner() from server.js
+    this._activeAgentRuns = new Map(); // key: runId, value: { agentId, projectId, sessionId, startedAt }
   }
 
   setProjects(projects) { this._projects = projects || []; }
@@ -3015,7 +3368,7 @@ class Jarvis {
         branch:  { label: "Branch",  icon: "fork",      riskLevel: "low",    requiresConfirmation: true, requiresGit: true, description: "Create a feature branch" },
         install: { label: "Install", icon: "package",   riskLevel: "low",    requiresConfirmation: true, requiresGit: false, description: "Run npm install" },
       },
-      features: { briefing: true, memory: true, selfImprovement: true, hooks: true, agents: true, workflows: true, trends: true, proposals: true }
+      features: { briefing: true, memory: true, selfImprovement: true, hooks: true, agents: true, agentAutoSpawn: true, dynamicAgents: true, workflows: true, trends: true, proposals: true }
     };
   }
 
@@ -3027,6 +3380,132 @@ class Jarvis {
   registerProposalExecutor(proposalType, executorFn) {
     this._proposalExecutors = this._proposalExecutors || {};
     this._proposalExecutors[proposalType] = executorFn;
+  }
+
+  registerAgentSpawner(spawnerFn) {
+    this._agentSpawner = spawnerFn;
+  }
+
+  /** Auto-spawn agents based on project analysis. Called after briefing generation. */
+  async _evaluateAndSpawnAgents(sessionResults) {
+    if (!this._agentSpawner) return;
+
+    // Budget gate
+    const dailyCost = this._memory.getDailyAgentCost();
+    if (dailyCost >= MAX_DAILY_AGENT_BUDGET_USD) return;
+
+    // Concurrency gate
+    if (this._activeAgentRuns.size >= MAX_CONCURRENT_AGENTS) return;
+
+    const allCandidates = [];
+    for (const result of sessionResults) {
+      const candidates = this._agentMgr.evaluateAutoSpawn(
+        result.id, result.personality, result.context, result.insights, this._memory
+      );
+      for (const c of candidates) {
+        c.projectName = result.name;
+        c.projectFolder = this._projects.find(p => p.id === result.id)?.folder;
+      }
+      allCandidates.push(...candidates);
+    }
+
+    if (allCandidates.length === 0) return;
+
+    // Spawn up to MAX_CONCURRENT_AGENTS - activeRuns
+    const slotsAvailable = MAX_CONCURRENT_AGENTS - this._activeAgentRuns.size;
+    const toSpawn = allCandidates.slice(0, slotsAvailable);
+
+    for (const candidate of toSpawn) {
+      if (!candidate.projectFolder) continue;
+      if (dailyCost + MAX_AGENT_BUDGET_USD > MAX_DAILY_AGENT_BUDGET_USD) break;
+
+      const runId = `${candidate.agentId}:${candidate.projectId}:${Date.now()}`;
+      try {
+        const sessionId = await this._agentSpawner({
+          agentId: candidate.agentId,
+          projectId: candidate.projectId,
+          projectFolder: candidate.projectFolder,
+          projectName: candidate.projectName,
+          prompt: candidate.prompt,
+          maxBudget: MAX_AGENT_BUDGET_USD,
+          runId,
+          dynamic: candidate.dynamic,
+          agentName: candidate.name,
+          onComplete: (output, cost) => this._handleAgentComplete(runId, candidate, output, cost),
+        });
+
+        this._activeAgentRuns.set(runId, {
+          agentId: candidate.agentId,
+          projectId: candidate.projectId,
+          sessionId,
+          startedAt: Date.now(),
+          name: candidate.name,
+          dynamic: candidate.dynamic,
+        });
+
+        // Record the run as started
+        this._memory.recordAgentRun({
+          id: runId,
+          agentId: candidate.agentId,
+          projectId: candidate.projectId,
+          status: "running",
+          dynamic: candidate.dynamic,
+          name: candidate.name,
+          cost: 0,
+        });
+
+      } catch (err) {
+        console.log(`  ⚠ Jarvis agent spawn failed (${candidate.agentId}): ${err.message}`);
+      }
+    }
+  }
+
+  /** Handle agent completion — parse results, store findings, update memory. */
+  _handleAgentComplete(runId, candidate, output, cost) {
+    this._activeAgentRuns.delete(runId);
+
+    // Parse the agent's output — look for the last JSON block in assistant messages
+    let findings = null;
+    const assistantMessages = (output || [])
+      .filter(o => o.role === "assistant" && o.text)
+      .map(o => o.text);
+
+    for (let i = assistantMessages.length - 1; i >= 0; i--) {
+      const text = assistantMessages[i];
+      // Try to extract JSON from markdown code block or raw JSON
+      const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/) || text.match(/(\{[\s\S]*\})\s*$/);
+      if (jsonMatch) {
+        try {
+          findings = JSON.parse(jsonMatch[1].trim());
+          break;
+        } catch {}
+      }
+    }
+
+    // Update the memory record
+    this._memory.updateAgentRun(runId, {
+      status: findings ? "completed" : "completed-no-parse",
+      completedAt: Date.now(),
+      cost: cost || 0,
+      findingsCount: findings?.findings?.length || 0,
+      severity: findings?.severity || null,
+      summary: findings?.summary || assistantMessages.slice(-1)[0]?.slice(0, 200) || null,
+      findings: findings?.findings?.slice(0, 20) || null, // cap stored findings
+    });
+
+    // Invalidate cache so next briefing includes agent results
+    this.invalidateCache();
+  }
+
+  /** Get current agent run status for the briefing/UI. */
+  getAgentStatus() {
+    return {
+      activeRuns: Array.from(this._activeAgentRuns.values()),
+      dailyCost: this._memory.getDailyAgentCost(),
+      dailyBudget: MAX_DAILY_AGENT_BUDGET_USD,
+      maxConcurrent: MAX_CONCURRENT_AGENTS,
+      cooldownMs: AGENT_COOLDOWN_MS,
+    };
   }
 
   async getBriefing(force = false) {
@@ -3108,6 +3587,9 @@ class Jarvis {
           // Select the best workflow recipe for observability / UI display
           const recipe = this._workflow.selectRecipe(personality, projectContext);
 
+          // Select agents — now content-aware with insights
+          const selectedAgents = this._agentMgr.selectAgentsForProject(personality, projectContext, allInsights);
+
           sessionResults.push({
             id: p.id, name: p.name, status: p.status,
             lastActivityAt: recap.lastActivityAt,
@@ -3117,7 +3599,8 @@ class Jarvis {
             insights: allInsights, context: projectContext, personality,
             healthScore, insightGroups,
             workflow: recipe.name,
-            recommendedAgents: this._agentMgr.selectAgentsForProject(personality, projectContext).map(a => a.id),
+            recommendedAgents: selectedAgents.map(a => ({ id: a.id, name: a.name, dynamic: !!a.dynamic })),
+            agentRuns: this._memory.getAgentRuns(p.id).slice(-5),
           });
         } catch {}
       }
@@ -3260,6 +3743,13 @@ class Jarvis {
           .then(() => this._memory.markReflected())
           .catch(() => {});
       }
+
+      // Agent auto-spawn — evaluate triggers and spawn agents asynchronously
+      // Runs after briefing is built so agents have full insight context
+      this._evaluateAndSpawnAgents(sessionResults).catch(() => {});
+
+      // Include agent status in briefing
+      briefing.agentStatus = this.getAgentStatus();
 
       this._cache = { briefing, generatedAt: Date.now(), scanning: false };
       this._cacheInvalidated = false;
@@ -3578,7 +4068,7 @@ class Jarvis {
       if (!sessionId) return res.status(400).json({ error: "sessionId required" });
       const session = this._cache.briefing?.sessions?.find(s => s.id === sessionId);
       if (!session) return res.status(404).json({ error: "Session not found in cached briefing" });
-      const agents = this._agentMgr.selectAgentsForProject(session.personality, session.context);
+      const agents = this._agentMgr.selectAgentsForProject(session.personality, session.context, session.insights || []);
       const project = this._projects.find(p => p.id === sessionId);
       res.json({
         agents,
@@ -3587,6 +4077,92 @@ class Jarvis {
           ? `${agents.length} specialized agent${agents.length !== 1 ? "s" : ""} recommended for ${project?.name || sessionId}`
           : "Standard workflow — no specialized agents needed for this project",
       });
+    });
+
+    // ── Agent auto-spawn routes ──
+
+    app.post(`${prefix}/agents/run`, ...middlewares, async (req, res) => {
+      const { agentId, sessionId } = req.body;
+      if (!agentId || !sessionId) return res.status(400).json({ error: "agentId and sessionId required" });
+      if (!this._agentSpawner) return res.status(503).json({ error: "Agent spawner not registered" });
+
+      const project = this._projects.find(p => p.id === sessionId);
+      if (!project?.folder) return res.status(404).json({ error: "Project not found or has no folder" });
+
+      const session = this._cache.briefing?.sessions?.find(s => s.id === sessionId);
+
+      // Budget check
+      const dailyCost = this._memory.getDailyAgentCost();
+      if (dailyCost >= MAX_DAILY_AGENT_BUDGET_USD) {
+        return res.status(429).json({ error: `Daily agent budget exhausted ($${dailyCost.toFixed(2)}/$${MAX_DAILY_AGENT_BUDGET_USD})` });
+      }
+
+      // Concurrency check
+      if (this._activeAgentRuns.size >= MAX_CONCURRENT_AGENTS) {
+        return res.status(429).json({ error: `Max concurrent agents reached (${MAX_CONCURRENT_AGENTS})` });
+      }
+
+      // Resolve prompt — static or dynamic
+      let prompt, agentName, isDynamic;
+      const staticSpec = AGENT_SPECS[agentId];
+      const dynamicTemplate = DYNAMIC_AGENT_TEMPLATES[agentId.replace("dynamic-", "")];
+
+      if (staticSpec) {
+        const promptPath = path.join(this._agentMgr._dir, staticSpec.file);
+        try { prompt = fs.readFileSync(promptPath, "utf8"); } catch {
+          return res.status(404).json({ error: `Agent definition file not found: ${staticSpec.file}` });
+        }
+        agentName = staticSpec.name;
+        isDynamic = false;
+      } else if (dynamicTemplate) {
+        prompt = dynamicTemplate.buildPrompt(session?.context, session?.insights || []);
+        agentName = dynamicTemplate.name;
+        isDynamic = true;
+      } else {
+        return res.status(404).json({ error: `Unknown agent: ${agentId}` });
+      }
+
+      const runId = `${agentId}:${sessionId}:${Date.now()}`;
+      try {
+        const agentSessionId = await this._agentSpawner({
+          agentId, projectId: sessionId, projectFolder: project.folder,
+          projectName: project.name, prompt, maxBudget: MAX_AGENT_BUDGET_USD,
+          runId, dynamic: isDynamic, agentName,
+          onComplete: (output, cost) => this._handleAgentComplete(runId, { agentId, projectId: sessionId, name: agentName }, output, cost),
+        });
+
+        this._activeAgentRuns.set(runId, {
+          agentId, projectId: sessionId, sessionId: agentSessionId,
+          startedAt: Date.now(), name: agentName, dynamic: isDynamic,
+        });
+        this._memory.recordAgentRun({
+          id: runId, agentId, projectId: sessionId, status: "running",
+          dynamic: isDynamic, name: agentName, cost: 0,
+        });
+
+        res.json({ ok: true, runId, sessionId: agentSessionId, message: `Agent "${agentName}" spawned for ${project.name}` });
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    app.get(`${prefix}/agents/status`, ...middlewares, (req, res) => {
+      res.json(this.getAgentStatus());
+    });
+
+    app.get(`${prefix}/agents/runs`, ...middlewares, (req, res) => {
+      const { projectId } = req.query;
+      const runs = this._memory.getAgentRuns(projectId || undefined);
+      res.json({ runs: runs.slice(-20) });
+    });
+
+    app.post(`${prefix}/agents/abort/:runId`, ...middlewares, (req, res) => {
+      const run = this._activeAgentRuns.get(req.params.runId);
+      if (!run) return res.status(404).json({ error: "No active agent run with that ID" });
+      // The actual abort is handled by the spawner callback killing the session process
+      this._activeAgentRuns.delete(req.params.runId);
+      this._memory.updateAgentRun(req.params.runId, { status: "aborted", completedAt: Date.now() });
+      res.json({ ok: true, message: `Agent "${run.name}" aborted` });
     });
   }
 }

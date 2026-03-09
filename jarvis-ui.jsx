@@ -622,13 +622,16 @@
               <div key={a.id} style={{ ...cardStyle, display: "flex", alignItems: "center", gap: 8 }}>
                 <div style={{ width: 28, height: 28, borderRadius: 6, background: "var(--glass3)",
                   display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, flexShrink: 0 }}>
-                  {a.id === "security-deep" ? "\🛡" : a.id === "dependency-graph" ? "\📦" : "\u26A1"}
+                  {a.dynamic ? "\u26A1" : a.id === "security-deep" ? "\uD83D\uDEE1" : a.id === "dependency-graph" ? "\uD83D\uDCE6" : "\u2699"}
                 </div>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontWeight: 600, color: "var(--txt)", fontSize: 11 }}>{a.name.replace("Jarvis ", "")}</div>
                   <div style={{ fontSize: 10, color: "var(--txt4)", marginTop: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{a.description}</div>
                 </div>
-                {a.exists && <span style={{ fontSize: 8, padding: "1px 5px", borderRadius: 4, background: "var(--grnBg, var(--glass3))", color: "var(--grn)", fontWeight: 700 }}>READY</span>}
+                {a.dynamic
+                  ? <span style={{ fontSize: 8, padding: "1px 5px", borderRadius: 4, background: "var(--accBg, var(--glass3))", color: "var(--accent, var(--acc))", fontWeight: 700, borderStyle: "dashed", border: "1px dashed var(--accent, var(--acc))" }}>DYNAMIC</span>
+                  : a.exists && <span style={{ fontSize: 8, padding: "1px 5px", borderRadius: 4, background: "var(--grnBg, var(--glass3))", color: "var(--grn)", fontWeight: 700 }}>READY</span>
+                }
               </div>
             ))}
             <button onClick={handleEnsureAgents} disabled={ensuringAgents}
@@ -1096,6 +1099,21 @@
                     </div>
                   )}
 
+                  {/* Active agent runs indicator */}
+                  {briefing.agentStatus?.activeRuns?.length > 0 && (
+                    <div style={{ display:"flex", alignItems:"center", gap:6, padding:"4px 8px", borderRadius:6,
+                      background:"color-mix(in srgb, var(--blu) 8%, var(--glass2))",
+                      border:"1px solid color-mix(in srgb, var(--blu) 15%, transparent)" }}>
+                      <span style={{ fontSize:12, animation:"jarvisPulse 2s ease-in-out infinite" }}>{"\u2699"}</span>
+                      <span style={{ fontSize:10, color:"var(--blu)", fontWeight:600 }}>
+                        {briefing.agentStatus.activeRuns.length} agent{briefing.agentStatus.activeRuns.length > 1 ? "s" : ""} running
+                      </span>
+                      <span style={{ fontSize:9, color:"var(--txt4)", marginLeft:"auto" }}>
+                        ${briefing.agentStatus.dailyCost?.toFixed(2) || "0.00"} today
+                      </span>
+                    </div>
+                  )}
+
                   {briefing.nudges?.length > 0 && (
                     <div style={{ display:"flex", flexDirection:"column", gap:4 }}>
                       <div style={{ fontSize:10, fontWeight:700, color:"var(--txt4)", textTransform:"uppercase", letterSpacing:.5, fontStyle:"italic" }}>
@@ -1406,12 +1424,28 @@
         });
     }, [apiBase, headers, fetchBriefing]);
 
+    const runAgent = useCallback((agentId, sessionId) => {
+      return fetch(`${apiBase}/api/jarvis/agents/run`, { method: "POST", headers: headers(), body: JSON.stringify({ agentId, sessionId }) })
+        .then(r => r.json())
+        .then(d => {
+          if (d.ok) fetchBriefing(true);
+          return d;
+        });
+    }, [apiBase, headers, fetchBriefing]);
+
+    const getAgentStatus = useCallback(() => {
+      return fetch(`${apiBase}/api/jarvis/agents/status`, { headers: headers() })
+        .then(r => r.ok ? r.json() : null);
+    }, [apiBase, headers]);
+
     return {
       briefing, isMinimized, showPanel: !!briefing, toggleMinimize, refresh: fetchBriefing,
       dismissInsight, executeAction, handleInit, handleWsMessage, respondToProposal,
       // Powers
       powersOpen, togglePowers, powers,
       runImprove, forgetRule, optimizeHooks, ensureAgents, recommendAgents,
+      // Agents
+      runAgent, getAgentStatus,
       // Deep Dive
       deepDiveOpen, toggleDeepDive,
     };
@@ -1607,7 +1641,7 @@
 
   // ── JarvisDeepDive — full-screen comprehensive insight view ─────────────
 
-  function JarvisDeepDive({ briefing, onClose, onDismissInsight, onAction, onRefresh, onRespondToProposal }) {
+  function JarvisDeepDive({ briefing, onClose, onDismissInsight, onAction, onRefresh, onRespondToProposal, onRunAgent }) {
     const [selectedSessionId, setSelectedSessionId] = useState(null);
     const [filterSeverity, setFilterSeverity] = useState("all");
     const [filterCategory, setFilterCategory] = useState("all");
@@ -1902,11 +1936,48 @@
                   {/* Recommended agents */}
                   {selectedSession.recommendedAgents?.length > 0 && (
                     <div style={{ display: "flex", gap: 4, marginTop: 6, flexWrap: "wrap" }}>
-                      {selectedSession.recommendedAgents.map((agent, i) => (
-                        <span key={i} style={{ fontSize: 9, padding: "2px 6px", borderRadius: 4,
-                          background: "color-mix(in srgb, var(--grn) 10%, var(--glass2))",
-                          color: "var(--grn)", fontWeight: 600, border: "1px solid color-mix(in srgb, var(--grn) 15%, transparent)" }}>
-                          {"\u2699"} {agent}
+                      {selectedSession.recommendedAgents.map((agent, i) => {
+                        const agentObj = typeof agent === "object" ? agent : { id: agent, name: agent, dynamic: false };
+                        const isDynamic = agentObj.dynamic;
+                        return (
+                          <span key={i} style={{ fontSize: 9, padding: "2px 6px", borderRadius: 4,
+                            background: isDynamic
+                              ? "color-mix(in srgb, var(--accent) 10%, var(--glass2))"
+                              : "color-mix(in srgb, var(--grn) 10%, var(--glass2))",
+                            color: isDynamic ? "var(--accent)" : "var(--grn)",
+                            fontWeight: 600,
+                            border: `1px solid color-mix(in srgb, ${isDynamic ? "var(--accent)" : "var(--grn)"} 15%, transparent)`,
+                            borderStyle: isDynamic ? "dashed" : "solid",
+                            cursor: "pointer",
+                          }}
+                            title={isDynamic ? "Dynamic agent — composed for this project" : "Static agent"}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (onRunAgent) onRunAgent(agentObj.id, selectedSession.id);
+                            }}>
+                            {isDynamic ? "\u26A1" : "\u2699"} {agentObj.name || agentObj.id}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {/* Agent run history */}
+                  {selectedSession.agentRuns?.length > 0 && (
+                    <div style={{ display: "flex", gap: 4, marginTop: 4, flexWrap: "wrap" }}>
+                      {selectedSession.agentRuns.slice(-3).map((run, i) => (
+                        <span key={i} style={{ fontSize: 8, padding: "1px 5px", borderRadius: 3,
+                          background: run.status === "running"
+                            ? "color-mix(in srgb, var(--blu) 15%, var(--glass2))"
+                            : run.status === "completed"
+                            ? "color-mix(in srgb, var(--grn) 8%, var(--glass2))"
+                            : "var(--glass2)",
+                          color: run.status === "running" ? "var(--blu)" : "var(--txt4)",
+                          border: "1px solid var(--glass-border)",
+                        }}
+                          title={run.summary || `${run.name} — ${run.status}`}>
+                          {run.status === "running" ? "\u23F3" : run.findingsCount > 0 ? `\u2714 ${run.findingsCount}` : "\u2714"}{" "}
+                          {run.name || run.agentId}
+                          {run.cost > 0 ? ` ($${run.cost.toFixed(3)})` : ""}
                         </span>
                       ))}
                     </div>
@@ -2025,6 +2096,35 @@
                         </div>
                       ))}
                     </div>
+                  </div>
+                )}
+
+                {/* Agent Status */}
+                {briefing.agentStatus && (
+                  <div style={{ padding: "12px 16px", borderRadius: 10, background: "var(--glass)", border: "1px solid var(--glass-border)",
+                    backdropFilter: "blur(16px)", WebkitBackdropFilter: "blur(16px)" }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                      <span style={{ fontSize: 11, fontWeight: 600, color: "var(--txt3)" }}>{"\u2699"} Agent Status</span>
+                      <span style={{ fontSize: 9, color: "var(--txt4)" }}>
+                        ${briefing.agentStatus.dailyCost?.toFixed(2) || "0.00"} / ${briefing.agentStatus.dailyBudget?.toFixed(2) || "5.00"} daily
+                      </span>
+                    </div>
+                    {briefing.agentStatus.activeRuns?.length > 0 ? (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                        {briefing.agentStatus.activeRuns.map((run, i) => (
+                          <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10 }}>
+                            <span style={{ fontSize: 9, padding: "1px 5px", borderRadius: 3, fontWeight: 600,
+                              background: "color-mix(in srgb, var(--blu) 15%, var(--glass2))", color: "var(--blu)",
+                              border: "1px solid color-mix(in srgb, var(--blu) 20%, transparent)",
+                              animation: "jarvisPulse 2s ease-in-out infinite" }}>{"\u23F3"} Running</span>
+                            <span style={{ flex: 1, color: "var(--txt3)" }}>{run.name || run.agentId}</span>
+                            {run.dynamic && <span style={{ fontSize: 8, color: "var(--accent, var(--acc))", fontWeight: 600 }}>DYNAMIC</span>}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: 10, color: "var(--txt4)" }}>No agents running — auto-spawn triggers on project insights</div>
+                    )}
                   </div>
                 )}
               </>
